@@ -1039,6 +1039,7 @@
 import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useApi } from '~/composables/useApi'
 import { normalizeWechatInstallPath, readStoredWechatInstallPath } from '~/lib/wechat-install-path'
+import { useChatAccountsStore } from '~/stores/chatAccounts'
 
 const {
   decryptDatabase,
@@ -1059,6 +1060,7 @@ const {
   getVoiceTranscriptionBatch,
   cancelVoiceTranscriptionBatch,
 } = useApi()
+const chatAccounts = useChatAccountsStore()
 
 const loading = ref(false)
 const error = ref('')
@@ -1072,6 +1074,7 @@ let dbKeyRequestRevision = 0
 let dbKeyRequestController = null
 const platformCapabilities = ref({ platform: '' })
 const platformCapabilitiesLoaded = ref(false)
+const autoPrepareRequested = ref(false)
 const isMacos = computed(() => platformCapabilities.value?.platform === 'macos')
 const imageKeyMemoryScanChecking = computed(() => !platformCapabilitiesLoaded.value)
 const imageKeyMemoryScanSupported = computed(() => {
@@ -1927,6 +1930,13 @@ const showDbKeyPersistenceWarning = (result) => {
   })
 }
 
+const openAutomaticallyPreparedAccount = async () => {
+  const account = String(mediaAccount.value || '').trim()
+  if (account) chatAccounts.setSelectedAccount(account)
+  autoPrepareRequested.value = false
+  await navigateTo('/chat')
+}
+
 const handleGetDbKey = async () => {
   if (isGettingDbKey.value) return
 
@@ -2491,6 +2501,11 @@ const handleDecrypt = async () => {
         currentStep.value = 1
         await ensureKeysForAccount(mediaAccount.value)
         showDbKeyPersistenceWarning(result)
+        if (autoPrepareRequested.value) {
+          loading.value = false
+          await openAutomaticallyPreparedAccount()
+          return
+        }
 
       } else if (result.status === 'failed') {
         if (result.failure_count > 0 && result.success_count === 0) {
@@ -2583,6 +2598,9 @@ const handleDecrypt = async () => {
             currentStep.value = 1
             await ensureKeysForAccount(mediaAccount.value)
             showDbKeyPersistenceWarning(data)
+            if (autoPrepareRequested.value) {
+              await openAutomaticallyPreparedAccount()
+            }
           } else if (data.status === 'failed') {
             error.value = data.message || '所有文件解密失败'
           } else {
@@ -3335,6 +3353,7 @@ onMounted(async () => {
         if (account.account_name) {
           mediaAccount.value = account.account_name
         }
+        autoPrepareRequested.value = account.auto_prepare === true
         // 清除sessionStorage
         sessionStorage.removeItem('selectedAccount')
         logDecryptDebug('mounted:selected-account-parsed', {
@@ -3342,6 +3361,15 @@ onMounted(async () => {
           data_dir: String(account.data_dir || '').trim()
         })
         await ensureKeysForAccount(mediaAccount.value)
+        if (autoPrepareRequested.value) {
+          if (!/^[0-9a-fA-F]{64}$/.test(String(formData.key || '').trim())) {
+            await handleGetDbKey()
+          }
+          if (/^[0-9a-fA-F]{64}$/.test(String(formData.key || '').trim())) {
+            warning.value = '密钥已匹配并保存，正在自动解密该账号...'
+            await handleDecrypt()
+          }
+        }
       } catch (e) {
         console.error('解析账户信息失败:', e)
         logDecryptDebug('mounted:selected-account-error', { error: formatLogError(e) })

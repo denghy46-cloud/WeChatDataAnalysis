@@ -105,6 +105,24 @@ export const useApi = () => {
     })
   }
 
+  // Inspect/prepare one detected account without exposing its saved DB key to the page.
+  const getAccountPrepareState = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params.account) query.set('account', params.account)
+    if (params.db_storage_path) query.set('db_storage_path', params.db_storage_path)
+    return await request(`/account/prepare?${query.toString()}`)
+  }
+
+  const prepareAccount = async (data = {}) => {
+    return await request('/account/prepare', {
+      method: 'POST',
+      body: {
+        account: data.account || '',
+        db_storage_path: data.db_storage_path || ''
+      }
+    })
+  }
+
   // 导入预览API
   const importDecryptedPreview = async (data) => {
     return await request('/import_decrypted/preview', {
@@ -987,6 +1005,8 @@ export const useApi = () => {
     detectWechat,
     detectCurrentAccount,
     decryptDatabase,
+    getAccountPrepareState,
+    prepareAccount,
     importDecryptedPreview,
     importDecrypted,
     healthCheck,
