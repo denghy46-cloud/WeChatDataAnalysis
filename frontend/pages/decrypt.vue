@@ -1934,29 +1934,83 @@ const handleGetDbKey = async () => {
     formData.key = ''
     formErrors.key = ''
 
-    if (platformCapabilities.value?.database_key_extraction !== true) {
+    const privateHelperAvailable = platformCapabilities.value?.database_key_private_helper === true
+    const resignCaptureAvailable = platformCapabilities.value?.database_key_resign_capture === true
+    if (
+      platformCapabilities.value?.database_key_extraction !== true
+      || (!privateHelperAvailable && !resignCaptureAvailable)
+    ) {
       error.value = platformCapabilities.value?.database_key_guidance || 'macOS 数据库密钥组件不可用，请更新或重新安装正式版本。'
       return
     }
+
+    const confirmTemporaryResign = () => requestGuideDialog({
+      eyebrow: 'macOS 临时重签方案',
+      title: '确认临时替换微信并在登录时捕获密钥',
+      description: '该方案会退出微信，保留并校验腾讯官方原版，临时启用可调试副本；捕获结束、失败、取消或下次启动 WCDA 时都会优先恢复官方原版。',
+      details: [
+        'SIP 保持开启，不会代填或保存管理员密码',
+        'macOS 可能询问临时微信访问原数据容器的权限，请选择允许',
+        '临时微信打开后，请在二维码页面重新登录当前数据库所属账号',
+        '整个过程请勿移动、更新或手动替换 /Applications/WeChat.app'
+      ],
+      note: '这是实验性方案。开始前会校验官方签名并创建第二份恢复副本；密钥只在本机内存中捕获并立即用当前消息库、会话库验真。',
+      primaryLabel: '开始临时重签捕获',
+      secondaryLabel: '取消',
+      tone: 'warning'
+    })
 
     const requestRevision = ++dbKeyRequestRevision
     const requestController = new AbortController()
     dbKeyRequestController = requestController
     isGettingDbKey.value = true
     error.value = ''
-    warning.value = '捕获已开始：现在请完整退出微信程序，再立即重新打开并登录；WCDA 会自动挂接重启后的微信进程，请勿关闭 WCDA 或当前页面。'
 
     try {
-      const res = await getKeys({
+      let keyMode = privateHelperAvailable ? 'macos_private_helper' : 'macos_resign_lldb'
+      if (keyMode === 'macos_resign_lldb') {
+        const confirmed = await confirmTemporaryResign()
+        if (!confirmed || !isDbKeyRequestActive(requestRevision, requestController)) return
+      }
+      warning.value = keyMode === 'macos_resign_lldb'
+        ? '正在创建恢复副本并启动临时微信。窗口出现后请重新登录目标账号；不要关闭 WCDA。'
+        : '捕获已开始：现在请完整退出微信程序，再立即重新打开并登录；WCDA 会自动挂接重启后的微信进程，请勿关闭 WCDA 或当前页面。'
+
+      let res = await getKeys({
         db_storage_path: String(formData.db_storage_path || '').trim(),
-        key_mode: 'macos_private_helper',
+        key_mode: keyMode,
         signal: requestController.signal
       })
       if (!isDbKeyRequestActive(requestRevision, requestController)) return
+
+      if (
+        res?.status !== 0
+        && res?.data?.error_code === 'TARGET_PROCESS_PROTECTED'
+        && resignCaptureAvailable
+      ) {
+        const confirmed = await confirmTemporaryResign()
+        if (!confirmed || !isDbKeyRequestActive(requestRevision, requestController)) {
+          error.value = res?.errmsg || '当前正式签名微信禁止调试附加。'
+          warning.value = ''
+          return
+        }
+        keyMode = 'macos_resign_lldb'
+        error.value = ''
+        warning.value = '正在创建恢复副本并启动临时微信。窗口出现后请重新登录目标账号；不要关闭 WCDA。'
+        res = await getKeys({
+          db_storage_path: String(formData.db_storage_path || '').trim(),
+          key_mode: keyMode,
+          signal: requestController.signal
+        })
+        if (!isDbKeyRequestActive(requestRevision, requestController)) return
+      }
+
       const key = String(res?.data?.db_key || '').trim().toLowerCase()
       if (res?.status === 0 && /^[0-9a-f]{64}$/.test(key)) {
         formData.key = key
-        warning.value = '数据库解密密钥已通过 macOS 本地受控组件获取成功！'
+        warning.value = keyMode === 'macos_resign_lldb'
+          ? '数据库密钥已捕获并验真，腾讯官方微信也已恢复！'
+          : '数据库解密密钥已通过 macOS 本地受控组件获取成功！'
         setTimeout(() => {
           if (
             requestRevision === dbKeyRequestRevision

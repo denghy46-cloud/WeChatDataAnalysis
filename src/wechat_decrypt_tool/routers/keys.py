@@ -8,6 +8,11 @@ from pydantic import BaseModel, Field
 
 from ..logging_config import get_logger
 from ..macos_db_key_helper import MacosDbKeyError
+from ..macos_resign_key_capture import (
+    MacosResignCaptureError,
+    inspect_resign_capture_capability,
+    recover_official_wechat,
+)
 from ..key_store import get_account_keys_from_store, normalize_key_store_path
 from ..key_service import (
     get_db_key_workflow,
@@ -28,7 +33,7 @@ def _log_macos_db_key_failure(
     fallback_code: str,
     fallback_retryable: bool,
 ) -> tuple[str, bool]:
-    known_error = isinstance(error, MacosDbKeyError)
+    known_error = isinstance(error, (MacosDbKeyError, MacosResignCaptureError))
     code = (
         str(getattr(error, "code", fallback_code) or fallback_code)
         if known_error
@@ -48,10 +53,59 @@ def _log_macos_db_key_failure(
     return code, retryable
 
 
+def _macos_key_method(key_mode: Optional[str]) -> str:
+    mode = str(key_mode or "").strip().lower()
+    if mode in {"macos_resign_lldb", "macos_temporary_resign", "temporary_resign"}:
+        return "macos_resign_lldb"
+    return "macos_private_helper"
+
+
 class ImageKeyMemoryRequest(BaseModel):
     account: Optional[str] = Field(None, description="账号目录名")
     db_storage_path: Optional[str] = Field(None, description="账号的 db_storage 路径")
     wxid_dir: Optional[str] = Field(None, description="微信原始账号目录")
+
+
+@router.get("/api/macos_key_capture/status", summary="检查 macOS 临时重签密钥捕获能力")
+async def get_macos_key_capture_status(
+    wechat_install_path: Optional[str] = None,
+    db_storage_path: Optional[str] = None,
+):
+    if not is_macos():
+        return {
+            "status": -1,
+            "errmsg": "该功能仅支持 macOS。",
+            "data": {"available": False, "code": "UNSUPPORTED_PLATFORM"},
+        }
+    data = await asyncio.to_thread(
+        inspect_resign_capture_capability,
+        wechat_app_path=wechat_install_path or "/Applications/WeChat.app",
+        db_storage_path=db_storage_path,
+    )
+    return {"status": 0, "errmsg": "ok", "data": data}
+
+
+@router.post("/api/macos_key_capture/recover", summary="恢复捕获前的腾讯官方微信")
+async def recover_macos_key_capture():
+    if not is_macos():
+        return {
+            "status": -1,
+            "errmsg": "该功能仅支持 macOS。",
+            "data": {"code": "UNSUPPORTED_PLATFORM"},
+        }
+    try:
+        data = await asyncio.to_thread(recover_official_wechat, cleanup=True)
+        return {"status": 0, "errmsg": "ok", "data": data}
+    except MacosResignCaptureError as exc:
+        logger.error(
+            "[keys] macOS official WeChat recovery failed: error_code=%s",
+            exc.code,
+        )
+        return {
+            "status": -1,
+            "errmsg": str(exc),
+            "data": {"code": exc.code, "retryable": exc.retryable},
+        }
 
 
 def _image_key_log_metadata(xor_value: object, aes_value: object) -> dict:
@@ -369,6 +423,11 @@ async def get_wechat_db_key(
                     db_storage_path=db_storage_path,
                     key_mode=key_mode or "macos_private_helper",
                     cancel_event=cancel_event,
+                    timeout_seconds=(
+                        330.0
+                        if _macos_key_method(key_mode) == "macos_resign_lldb"
+                        else 120.0
+                    ),
                 )
             )
             disconnect_watcher = asyncio.create_task(watch_disconnect())
@@ -399,7 +458,7 @@ async def get_wechat_db_key(
 
     except TimeoutError as e:
         if is_macos():
-            known_error = isinstance(e, MacosDbKeyError)
+            known_error = isinstance(e, (MacosDbKeyError, MacosResignCaptureError))
             error_code, retryable = _log_macos_db_key_failure(
                 e,
                 fallback_code="TIMEOUT",
@@ -414,7 +473,7 @@ async def get_wechat_db_key(
                 ),
                 "data": {
                     "platform": "macos",
-                    "method": "macos_private_helper",
+                    "method": _macos_key_method(key_mode),
                     "error_code": error_code,
                     "retryable": retryable,
                     "manual_input_supported": True,
@@ -438,7 +497,7 @@ async def get_wechat_db_key(
         }
     except Exception as e:
         if is_macos():
-            known_error = isinstance(e, MacosDbKeyError)
+            known_error = isinstance(e, (MacosDbKeyError, MacosResignCaptureError))
             error_code, retryable = _log_macos_db_key_failure(
                 e,
                 fallback_code="INTERNAL_ERROR",
@@ -453,7 +512,7 @@ async def get_wechat_db_key(
                 ),
                 "data": {
                     "platform": "macos",
-                    "method": "macos_private_helper",
+                    "method": _macos_key_method(key_mode),
                     "error_code": error_code,
                     "retryable": retryable,
                     "manual_input_supported": True,

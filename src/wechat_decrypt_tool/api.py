@@ -2,6 +2,7 @@
 
 import mimetypes
 import os
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -255,6 +256,30 @@ def _maybe_mount_frontend() -> None:
 
 
 _maybe_mount_frontend()
+
+
+@app.on_event("startup")
+async def _startup_recover_macos_key_capture() -> None:
+    if sys.platform != "darwin":
+        return
+    from .macos_resign_key_capture import capture_journal_path, recover_official_wechat
+
+    if not capture_journal_path().exists():
+        return
+    try:
+        result = recover_official_wechat(cleanup=True)
+        logger.warning(
+            "Recovered official WeChat from an interrupted key-capture transaction: state=%s",
+            str(result.get("state") or "unknown"),
+        )
+    except Exception as exc:
+        logger.critical(
+            "Official WeChat recovery requires attention: error_code=%s",
+            str(getattr(exc, "code", "RECOVERY_FAILED")),
+        )
+        raise RuntimeError(
+            "Official WeChat recovery failed; run the emergency recovery command before starting WCDA."
+        ) from exc
 
 
 @app.on_event("startup")

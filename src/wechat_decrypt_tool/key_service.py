@@ -679,6 +679,24 @@ def get_db_key_workflow(
 ):
     if is_macos():
         mode = str(key_mode or "auto").strip().lower()
+        resign_modes = {
+            "macos_resign_lldb",
+            "macos_temporary_resign",
+            "temporary_resign",
+        }
+        if mode in resign_modes:
+            if not str(db_storage_path or "").strip():
+                raise RuntimeError("macOS 临时重签捕获需要当前账号的 db_storage 路径")
+            from .macos_resign_key_capture import (
+                capture_database_key_with_temporary_resign,
+            )
+
+            return capture_database_key_with_temporary_resign(
+                wechat_app_path=wechat_install_path or "/Applications/WeChat.app",
+                db_storage_path=str(db_storage_path),
+                timeout_seconds=max(float(timeout_seconds), 300.0),
+                cancel_event=cancel_event,
+            )
         if mode not in {"auto", "macos_private_helper", "mac_private_helper"}:
             raise RuntimeError(f"macOS 不支持数据库密钥获取模式: {key_mode}")
         from .macos_db_key_helper import (

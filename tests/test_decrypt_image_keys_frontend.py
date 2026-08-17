@@ -112,14 +112,19 @@ def test_database_key_action_waits_for_platform_detection():
     assert "!platformCapabilitiesLoaded ? '正在检测系统'" in source
 
 
-def test_macos_database_key_uses_the_bundled_authorized_helper_without_external_guidance():
+def test_macos_database_key_uses_helper_then_offers_controlled_temporary_resign():
     source = read_decrypt_page()
 
-    assert "key_mode: 'macos_private_helper'" in source
+    assert "'macos_private_helper'" in source
+    assert "'macos_resign_lldb'" in source
+    assert "TARGET_PROCESS_PROTECTED" in source
     assert "platformCapabilities.value?.database_key_extraction !== true" in source
     assert "捕获已开始" in source
     assert "完整退出微信程序" in source
     assert "自动挂接重启后的微信进程" in source
+    assert "SIP 保持开启" in source
+    assert "创建第二份恢复副本" in source
+    assert "腾讯官方微信也已恢复" in source
     assert "仅退出当前账号" not in source
     assert "数据库解密密钥已通过 macOS 本地受控组件获取成功" in source
     assert "打开 WeFlow 项目页" not in source
