@@ -1,6 +1,7 @@
 from bisect import bisect_left, bisect_right
 from functools import lru_cache
 from pathlib import Path
+import asyncio
 import os
 import base64
 import hashlib
@@ -26,7 +27,7 @@ from ..account_source_policy import account_prefers_decrypted_snapshot
 from ..chat_helpers import _load_contact_rows, _pick_display_name, _resolve_account_dir
 from ..logging_config import get_logger
 from ..source_fallback import build_source_fallback_meta, normalize_data_source
-from ..media_helpers import _read_and_maybe_decrypt_media, _resolve_account_wxid_dir
+from ..media_helpers import _load_media_keys, _read_and_maybe_decrypt_media, _resolve_account_wxid_dir
 from ..path_fix import PathFixRoute
 from ..perf_trace import create_perf_trace
 from .. import sns_media as _sns_media
@@ -64,6 +65,73 @@ _SNS_TIMELINE_AUTO_CACHE_TTL_SECONDS = 60
 # Key: (account_dir.name, sorted(usernames), keyword) -> (expires_at_ts, force_sqlite)
 _SNS_TIMELINE_AUTO_CACHE: dict[tuple[str, tuple[str, ...], str], tuple[float, bool]] = {}
 _SNS_TIMELINE_AUTO_CACHE_MU = threading.Lock()
+
+_SNS_IMAGE_KEY_AUTO_LOCKS: dict[str, asyncio.Lock] = {}
+_SNS_IMAGE_KEY_AUTO_LOCKS_MU = threading.Lock()
+
+
+def _sns_image_key_auto_lock(account_dir: Path) -> asyncio.Lock:
+    key = str(Path(account_dir))
+    with _SNS_IMAGE_KEY_AUTO_LOCKS_MU:
+        lock = _SNS_IMAGE_KEY_AUTO_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _SNS_IMAGE_KEY_AUTO_LOCKS[key] = lock
+        return lock
+
+
+def _sns_has_complete_local_image_keys(account_dir: Path) -> bool:
+    try:
+        keys = _load_media_keys(account_dir)
+        xor_key = keys.get("xor")
+        aes_key = str(keys.get("aes") or "").strip()
+        return (
+            keys.get("verified") is True
+            and isinstance(xor_key, int)
+            and 0 <= xor_key <= 0xFF
+            and len(aes_key) >= 16
+        )
+    except Exception:
+        return False
+
+
+async def _try_auto_resolve_sns_image_keys(
+        *,
+        account_dir: Path,
+        wxid_dir: Optional[Path],
+        local_path: Path,
+) -> bool:
+    """Locally derive and V2-verify missing image keys, once per account at a time."""
+    if wxid_dir is None or _sns_has_complete_local_image_keys(account_dir):
+        return False
+
+    try:
+        with local_path.open("rb") as stream:
+            if stream.read(6) != b"\x07\x08V2\x08\x07":
+                return False
+    except OSError:
+        return False
+
+    lock = _sns_image_key_auto_lock(account_dir)
+    async with lock:
+        if _sns_has_complete_local_image_keys(account_dir):
+            return True
+        try:
+            from ..key_service import get_image_key_integrated_workflow
+
+            result = await get_image_key_integrated_workflow(
+                account=Path(account_dir).name,
+                wxid_dir=str(wxid_dir),
+                allow_remote=False,
+            )
+            return result.get("verified") is True and _sns_has_complete_local_image_keys(account_dir)
+        except Exception as exc:
+            logger.info(
+                "[sns.image-key] local auto resolution skipped: account=%s errorType=%s",
+                Path(account_dir).name,
+                type(exc).__name__,
+            )
+            return False
 
 
 def _sns_timeline_auto_cache_key(account_dir: Path, users: list[str], kw: str) -> tuple[str, tuple[str, ...], str]:
@@ -3392,11 +3460,30 @@ async def get_sns_media(
             )
             try:
                 payload, local_media_type = _read_and_maybe_decrypt_media(Path(local_path), account_dir)
+                auto_resolved_image_key = False
+                if not (payload and str(local_media_type or "").startswith("image/")):
+                    auto_resolved_image_key = await _try_auto_resolve_sns_image_keys(
+                        account_dir=account_dir,
+                        wxid_dir=wxid_dir,
+                        local_path=Path(local_path),
+                    )
+                    trace(
+                        "local-cache:image-key-auto",
+                        matchedBy=matched_by,
+                        resolved=auto_resolved_image_key,
+                    )
+                    if auto_resolved_image_key:
+                        payload, local_media_type = _read_and_maybe_decrypt_media(
+                            Path(local_path),
+                            account_dir,
+                        )
                 if payload and str(local_media_type or "").startswith("image/"):
                     resp = Response(content=payload, media_type=str(local_media_type or "image/jpeg"))
                     resp.headers["Cache-Control"] = "public, max-age=31536000"
                     resp.headers["X-SNS-Source"] = "local-cache"
                     resp.headers["X-SNS-Diagnostic-Id"] = request_id
+                    if auto_resolved_image_key:
+                        resp.headers["X-SNS-Image-Key-Auto-Resolved"] = "1"
                     trace(
                         "response:ready",
                         result="local-cache",

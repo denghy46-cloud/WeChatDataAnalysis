@@ -810,6 +810,38 @@ class TestSnsMedia(unittest.TestCase):
         out2 = sns_media.fix_sns_cdn_url(u2, token="tkn", is_video=False)
         self.assertEqual(out2, "https://mmsns.qpic.cn/sns/abc/0?foo=bar&token=tkn&idx=1")
 
+    def test_remote_image_falls_back_to_token_bound_thumbnail_path(self):
+        calls: list[str] = []
+        jpeg = b"\xff\xd8\xff\x00thumbnail"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            if request.url.path.endswith("/0"):
+                return httpx.Response(400, request=request)
+            if request.url.path.endswith("/150"):
+                return httpx.Response(200, content=jpeg, request=request)
+            return httpx.Response(404, request=request)
+
+        async def run(account_dir: Path):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                return await sns_media.try_fetch_and_decrypt_sns_image_remote(
+                    account_dir=account_dir,
+                    url="https://mmsns.qpic.cn/sns/token-bound/150",
+                    key="",
+                    token="thumbnail-token",
+                    use_cache=False,
+                    client=client,
+                )
+
+        with TemporaryDirectory() as td:
+            result = asyncio.run(run(Path(td)))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.payload, jpeg)
+        self.assertEqual(result.media_type, "image/jpeg")
+        self.assertEqual(calls, ["/sns/token-bound/0", "/sns/token-bound/150"])
+
     def test_fix_sns_cdn_url_replaces_stale_token_and_idx(self):
         out = sns_media.fix_sns_cdn_url(
             "https://mmsns.qpic.cn/sns/abc/0?token=stale&idx=9&foo=bar",

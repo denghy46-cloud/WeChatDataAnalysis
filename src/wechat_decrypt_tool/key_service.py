@@ -1135,8 +1135,9 @@ async def get_image_key_integrated_workflow(
         *,
         wxid_dir: Optional[str] = None,
         db_storage_path: Optional[str] = None,
+        allow_remote: bool = True,
 ) -> Dict[str, Any]:
-    """Resolve image keys locally with real V2 validation before remote fallback."""
+    """Resolve image keys locally with real V2 validation before optional remote fallback."""
     resolved_wxid_dir: Optional[Path] = None
     try:
         resolved_wxid_dir = _resolve_wxid_dir_for_image_key(
@@ -1303,6 +1304,9 @@ async def get_image_key_integrated_workflow(
                     aes_key=aes_key,
                     source="native_v2_verified",
                 )
+
+    if not allow_remote:
+        raise RuntimeError("本地 V2 图片密钥解析未命中")
 
     logger.info("[image_key] 本地验真未命中，最后尝试远程 API 解析")
     remote_result = await fetch_and_save_remote_keys(

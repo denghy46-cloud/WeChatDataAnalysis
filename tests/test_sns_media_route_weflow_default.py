@@ -309,6 +309,73 @@ class TestSnsMediaRouteWeFlowDefault(unittest.TestCase):
                     heuristic.assert_not_called()
                     remote.assert_not_called()
 
+    def test_route_auto_resolves_v2_image_key_and_retries_local_decode(self):
+        with TemporaryDirectory() as td:
+            account_dir = Path(td) / "acc"
+            wxid_dir = Path(td) / "wxid_acc_suffix"
+            account_dir.mkdir(parents=True, exist_ok=True)
+            wxid_dir.mkdir(parents=True, exist_ok=True)
+            local_path = wxid_dir / "v2-cache"
+            encrypted = b"\x07\x08V2\x08\x07" + (b"encrypted" * 4)
+            decoded = b"\xff\xd8\xff\x00decoded"
+            local_path.write_bytes(encrypted)
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch(
+                        "wechat_decrypt_tool.routers.sns._resolve_account_dir",
+                        return_value=account_dir,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "wechat_decrypt_tool.routers.sns._resolve_account_wxid_dir",
+                        return_value=wxid_dir,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch(
+                        "wechat_decrypt_tool.routers.sns._resolve_sns_cached_image_path_by_cache_key",
+                        return_value=str(local_path),
+                    )
+                )
+                read_media = stack.enter_context(
+                    mock.patch(
+                        "wechat_decrypt_tool.routers.sns._read_and_maybe_decrypt_media",
+                        side_effect=[
+                            (encrypted, "application/octet-stream"),
+                            (decoded, "image/jpeg"),
+                        ],
+                    )
+                )
+                auto_resolve = stack.enter_context(
+                    mock.patch(
+                        "wechat_decrypt_tool.routers.sns._try_auto_resolve_sns_image_keys",
+                        new=mock.AsyncMock(return_value=True),
+                    )
+                )
+                remote = stack.enter_context(
+                    mock.patch("wechat_decrypt_tool.routers.sns._try_fetch_and_decrypt_sns_remote")
+                )
+
+                response = asyncio.run(
+                    sns.get_sns_media(
+                        account="acc",
+                        post_id="post-v2",
+                        media_id="media-v2",
+                        post_type=1,
+                        media_type=2,
+                        use_cache=1,
+                    )
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.body, decoded)
+        self.assertEqual(response.headers.get("X-SNS-Image-Key-Auto-Resolved"), "1")
+        self.assertEqual(read_media.call_count, 2)
+        auto_resolve.assert_awaited_once()
+        remote.assert_not_called()
+
     def test_route_logs_final_not_found_with_diagnostic_id(self):
         with TemporaryDirectory() as td:
             account_dir = Path(td) / "acc"

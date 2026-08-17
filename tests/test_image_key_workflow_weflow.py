@@ -189,6 +189,43 @@ def test_unverified_native_name_match_does_not_persist_and_remote_is_last(tmp_pa
     assert result["verified"] is False
 
 
+def test_local_only_workflow_never_calls_remote_fallback(tmp_path: Path) -> None:
+    wxid_dir = tmp_path / "xwechat_files" / "wxid_demo_abcd"
+    wxid_dir.mkdir(parents=True)
+    empty_scan = TemplateScanResult(
+        templates=(),
+        inferred_xor_key=None,
+        used_fallback=False,
+        files_scanned=0,
+    )
+
+    with mock.patch.object(
+        key_service, "_resolve_wxid_dir_for_image_key", return_value=wxid_dir
+    ), mock.patch.object(
+        key_service, "get_account_keys_from_store", return_value={}
+    ), mock.patch.object(
+        key_service, "try_get_local_image_keys", return_value=[]
+    ), mock.patch.object(
+        key_service, "parse_global_config", return_value={}
+    ), mock.patch.object(
+        key_service, "scan_v2_templates", return_value=empty_scan
+    ), mock.patch.object(
+        key_service, "resolve_local_image_key", return_value=None
+    ), mock.patch.object(
+        key_service, "fetch_and_save_remote_keys", new=mock.AsyncMock()
+    ) as remote_mock:
+        with pytest.raises(RuntimeError, match="本地 V2 图片密钥解析未命中"):
+            asyncio.run(
+                key_service.get_image_key_integrated_workflow(
+                    "wxid_demo",
+                    wxid_dir=str(wxid_dir),
+                    allow_remote=False,
+                )
+            )
+
+    remote_mock.assert_not_awaited()
+
+
 def test_verified_cache_bound_to_current_wxid_dir_skips_all_probes(tmp_path: Path) -> None:
     wxid_dir = tmp_path / "xwechat_files" / "wxid_demo_abcd"
     wxid_dir.mkdir(parents=True)

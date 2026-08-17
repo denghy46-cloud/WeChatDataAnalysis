@@ -133,7 +133,13 @@ def _sns_remote_diagnostic_log(
     )
 
 
-def fix_sns_cdn_url(url: str, *, token: str = "", is_video: bool = False) -> str:
+def fix_sns_cdn_url(
+    url: str,
+    *,
+    token: str = "",
+    is_video: bool = False,
+    preserve_image_size: bool = False,
+) -> str:
     """WeFlow-compatible SNS CDN URL normalization.
 
     - Force https for Tencent CDNs.
@@ -157,7 +163,9 @@ def fix_sns_cdn_url(url: str, *, token: str = "", is_video: bool = False) -> str
     u = re.sub(r"^http://", "https://", u, flags=re.I)
 
     # /150|/200|/480 -> /0 (image only; matches WeFlow's original-image request behavior).
-    if not is_video:
+    # A thumbnail token can be bound to its original size path, so callers may preserve
+    # that path for a fallback request when the CDN rejects the upgraded URL.
+    if not is_video and not preserve_image_size:
         u = re.sub(r"/(?:150|200|480)(?=($|\?))", "/0", u)
 
     tok = str(token or "").strip()
@@ -947,16 +955,36 @@ async def try_fetch_and_decrypt_sns_image_remote(
 
     cache_path: Optional[Path] = None
 
-    try:
-        raw, _content_type, x_enc = await _download_sns_remote_bytes(u_fixed, client=client)
-    except Exception as e:
+    download_urls = [u_fixed]
+    size_preserved_url = fix_sns_cdn_url(
+        url,
+        token=token,
+        is_video=False,
+        preserve_image_size=True,
+    )
+    if size_preserved_url and size_preserved_url not in download_urls:
+        download_urls.append(size_preserved_url)
+
+    raw = b""
+    _content_type = ""
+    x_enc = ""
+    download_error: Optional[Exception] = None
+    for download_url in download_urls:
+        try:
+            raw, _content_type, x_enc = await _download_sns_remote_bytes(download_url, client=client)
+            download_error = None
+            break
+        except Exception as exc:
+            download_error = exc
+
+    if download_error is not None:
         _sns_remote_diagnostic_log(
             "remote:download-error",
             url=u_fixed,
             diagnostic_id=diagnostic_id,
             key=key,
             token=token,
-            error=e,
+            error=download_error,
         )
         return None
 
@@ -1082,4 +1110,3 @@ async def try_fetch_and_decrypt_sns_image_remote(
         x_enc=str(x_enc or "").strip(),
         cache_path=cache_path,
     )
-
