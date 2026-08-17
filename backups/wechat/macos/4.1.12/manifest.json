@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-08-17T07:57:14Z",
+  "wechat": {
+    "bundleIdentifier": "com.tencent.xinWeChat",
+    "developerTeamIdentifier": "5A4RE8SF68",
+    "architectures": [
+      "arm64",
+      "x86_64"
+    ],
+    "packageKind": "Universal 2"
+  },
+  "captureHost": {
+    "hardwareModel": "Mac16,9",
+    "chip": "Apple M4 Max",
+    "architecture": "arm64",
+    "macOSVersion": "26.5.1",
+    "macOSBuild": "25F80"
+  },
+  "artifacts": [
+    {
+      "file": "WeChatMac-4.1.12-build269341-universal-official.dmg",
+      "bytes": 509508392,
+      "sha256": "92d02efd9f0ad775de6b1ebabdb8ec73f024655e7e46f6bb0ef494e2b197b96b",
+      "version": "4.1.12",
+      "build": "269341",
+      "wechatBundleVersion": "4.1.12.29",
+      "architectures": [
+        "arm64",
+        "x86_64"
+      ],
+      "provenance": "Original Tencent installer retained on the capture host",
+      "appSignatureVerified": true,
+      "dmgChecksumVerified": true
+    },
+    {
+      "file": "WeChatMac-4.1.12-build269365-universal-snapshot.dmg",
+      "bytes": 648860759,
+      "sha256": "84cb32268c9d47b12d048d83e96569a4210944854ce0d15b2fc57a5a231b3acb",
+      "version": "4.1.12",
+      "build": "269365",
+      "wechatBundleVersion": "4.1.12.53",
+      "architectures": [
+        "arm64",
+        "x86_64"
+      ],
+      "provenance": "Read-only local DMG created from /Applications/WeChat.app",
+      "appSignatureVerified": true,
+      "dmgChecksumVerified": true,
+      "note": "The DMG container is locally generated; the WeChat.app inside retains Tencent's original Developer ID signature."
+    }
+  ],
+  "containsUserData": false
+}

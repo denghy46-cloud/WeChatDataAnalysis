@@ -87,3 +87,7 @@ pnpm-lock.yaml
 
 # Local scratch file accidentally generated during development
 /bento-summary.html
+
+# Local vendor installer backups are intentionally kept beside the project but
+# not in normal Git history (GitHub rejects files larger than 100 MiB).
+/backups/wechat/**/*.dmg
