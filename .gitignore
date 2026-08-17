@@ -91,3 +91,6 @@ pnpm-lock.yaml
 # Local vendor installer backups are intentionally kept beside the project but
 # not in normal Git history (GitHub rejects files larger than 100 MiB).
 /backups/wechat/**/*.dmg
+
+# Local runtime state managed by wcda-menu.sh
+/.wcda-runtime/
