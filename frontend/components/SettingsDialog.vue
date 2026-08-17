@@ -670,6 +670,31 @@
                   <template v-else>{{ desktopUpdate.lastCheckMessage.value }}</template>
                 </div>
               </div>
+              <div class="px-3.5 py-3">
+                <div class="flex items-center justify-between gap-3">
+                  <div class="min-w-0 flex-1">
+                    <div class="text-[13px] font-medium text-[#222]">阻止微信自动升级</div>
+                    <div class="mt-0.5 text-[11px] text-[#909090]">{{ wechatUpdateGuardDescription }}</div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    :aria-checked="wechatUpdateGuard.enabled"
+                    class="settings-switch shrink-0"
+                    :class="switchTrackClass(wechatUpdateGuard.enabled, wechatUpdateGuardLoading)"
+                    :disabled="!wechatUpdateGuard.supported || wechatUpdateGuardLoading"
+                    @click="toggleWechatUpdateGuard"
+                  >
+                    <span class="settings-switch-thumb" :class="wechatUpdateGuard.enabled ? 'translate-x-[20px]' : 'translate-x-0'" />
+                  </button>
+                </div>
+                <div v-if="wechatUpdateGuardError" class="mt-2">
+                  <ErrorNotice :message="wechatUpdateGuardError" compact manual />
+                </div>
+                <div v-else-if="wechatUpdateGuardMessage" class="mt-2 rounded-[6px] border border-[#dff2e6] bg-[#f4fbf7] px-2.5 py-1.5 text-[11px] text-[#4d7960]">
+                  {{ wechatUpdateGuardMessage }}
+                </div>
+              </div>
             </div>
           </section>
 
@@ -759,6 +784,32 @@ const desktopVersionText = computed(() => {
 })
 
 const desktopDefaultToChatWhenData = ref(false)
+
+const wechatUpdateGuard = ref({
+  supported: false,
+  enabled: false,
+  requested: false,
+  healthy: false,
+  wechatRunning: false,
+  wechatVersion: '',
+  wechatBuild: '',
+  officialSignature: false,
+  cacheLocked: false,
+  quarantineCount: 0,
+})
+const wechatUpdateGuardLoading = ref(false)
+const wechatUpdateGuardError = ref('')
+const wechatUpdateGuardMessage = ref('')
+const wechatUpdateGuardDescription = computed(() => {
+  if (!wechatUpdateGuard.value.supported) return '仅支持 macOS 桌面微信'
+  const version = String(wechatUpdateGuard.value.wechatVersion || '').trim()
+  const build = String(wechatUpdateGuard.value.wechatBuild || '').trim()
+  const suffix = version ? `微信 ${version}${build ? ` (${build})` : ''}` : '当前微信'
+  if (wechatUpdateGuard.value.enabled) {
+    return `已保护 ${suffix}；暂存更新目录持续锁定，更新偏好会自动纠正`
+  }
+  return `保护 ${suffix}，不修改微信程序和官方签名，可随时恢复`
+})
 
 const cdnImageEnabled = ref(false)
 const cdnImageLoading = ref(false)
@@ -2106,6 +2157,44 @@ const onDesktopCheckUpdates = async () => {
   await desktopUpdate.manualCheck()
 }
 
+const applyWechatUpdateGuardStatus = (res) => {
+  wechatUpdateGuard.value = {
+    ...wechatUpdateGuard.value,
+    ...(res || {}),
+    supported: res?.supported === true,
+    enabled: res?.enabled === true,
+  }
+  wechatUpdateGuardMessage.value = String(res?.message || '').trim()
+}
+
+const refreshWechatUpdateGuard = async () => {
+  try {
+    const res = await api.getWechatUpdateGuardStatus()
+    applyWechatUpdateGuardStatus(res)
+    wechatUpdateGuardError.value = ''
+  } catch (error) {
+    wechatUpdateGuardError.value = String(
+      error?.data?.detail || error?.detail || error?.message || '读取微信更新保护状态失败'
+    )
+  }
+}
+
+const toggleWechatUpdateGuard = async () => {
+  if (wechatUpdateGuardLoading.value || !wechatUpdateGuard.value.supported) return
+  wechatUpdateGuardLoading.value = true
+  wechatUpdateGuardError.value = ''
+  try {
+    const res = await api.toggleWechatUpdateGuard(!wechatUpdateGuard.value.enabled)
+    applyWechatUpdateGuardStatus(res)
+  } catch (error) {
+    wechatUpdateGuardError.value = String(
+      error?.data?.detail || error?.detail || error?.message || '切换微信更新保护失败'
+    )
+  } finally {
+    wechatUpdateGuardLoading.value = false
+  }
+}
+
 const refreshSettingsDialogData = async () => {
   if (!process.client || typeof window === 'undefined') return
 
@@ -2116,6 +2205,7 @@ const refreshSettingsDialogData = async () => {
     refreshMcpToken(),
     refreshBackendLogFileInfo(),
     refreshSavedKeys(),
+    refreshWechatUpdateGuard(),
   ]
 
 

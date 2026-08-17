@@ -995,6 +995,17 @@ export const useApi = () => {
     })
   }
 
+  const getWechatUpdateGuardStatus = async () => {
+    return await request('/system/wechat_update_guard/status')
+  }
+
+  const toggleWechatUpdateGuard = async (enabled) => {
+    return await request('/system/wechat_update_guard/toggle', {
+      method: 'POST',
+      body: { enabled: !!enabled }
+    })
+  }
+
 
   return {
     pickSystemDirectory,
@@ -1002,6 +1013,8 @@ export const useApi = () => {
     toggleImgHelper,
     getCdnImageStatus,
     toggleCdnImage,
+    getWechatUpdateGuardStatus,
+    toggleWechatUpdateGuard,
     detectWechat,
     detectCurrentAccount,
     decryptDatabase,

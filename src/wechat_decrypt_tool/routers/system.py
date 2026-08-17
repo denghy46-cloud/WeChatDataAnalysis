@@ -8,6 +8,12 @@ from pydantic import BaseModel
 from .. import cdn_image_service
 from ..img_helper import IMG_HELPER
 from ..platform_support import is_windows, runtime_capabilities
+from ..wechat_update_guard import (
+    WeChatRunningError,
+    WeChatUpdateGuardError,
+    get_wechat_update_guard_status,
+    set_wechat_update_guard,
+)
 from .wechat_detection import check_wechat_status
 
 router = APIRouter()
@@ -106,3 +112,25 @@ async def toggle_cdn_image(req: CdnImageToggleRequest):
         "enabled": cdn_image_service.is_cdn_download_enabled(),
         "dailyLimit": cdn_image_service.DAILY_DOWNLOAD_LIMIT,
     }
+
+
+@router.get("/api/system/wechat_update_guard/status", summary="获取 macOS 微信更新保护状态")
+async def wechat_update_guard_status():
+    try:
+        return await asyncio.to_thread(get_wechat_update_guard_status)
+    except WeChatUpdateGuardError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class WeChatUpdateGuardToggleRequest(BaseModel):
+    enabled: bool
+
+
+@router.post("/api/system/wechat_update_guard/toggle", summary="开启/关闭 macOS 微信更新保护")
+async def toggle_wechat_update_guard(req: WeChatUpdateGuardToggleRequest):
+    try:
+        return await asyncio.to_thread(set_wechat_update_guard, bool(req.enabled))
+    except WeChatRunningError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except WeChatUpdateGuardError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

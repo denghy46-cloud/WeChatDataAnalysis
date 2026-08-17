@@ -295,6 +295,12 @@ async def _startup_native_core() -> None:
 @app.on_event("startup")
 async def _startup_background_jobs() -> None:
     try:
+        from .wechat_update_guard import start_update_guard_enforcer
+
+        start_update_guard_enforcer()
+    except Exception:
+        logger.exception("Failed to start WeChat update preference enforcer")
+    try:
         WCDB_REALTIME.start_background_prime()
     except Exception:
         logger.exception("Failed to start native-core account preparation")
@@ -310,6 +316,12 @@ async def _startup_background_jobs() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown_wcdb_realtime() -> None:
+    try:
+        from .wechat_update_guard import stop_update_guard_enforcer
+
+        stop_update_guard_enforcer()
+    except Exception:
+        pass
     try:
         CHAT_REALTIME_AUTOSYNC.stop()
     except Exception:
