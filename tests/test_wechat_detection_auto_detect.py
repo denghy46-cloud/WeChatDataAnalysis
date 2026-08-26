@@ -128,6 +128,36 @@ class TestWechatDetectionAutoDetect(unittest.TestCase):
             self.assertEqual(accounts[0]["data_dir"], str(account_dir))
             self.assertEqual(accounts[0]["database_count"], 1)
 
+    def test_macos_generic_home_does_not_become_a_wechat_root_from_unrelated_sqlite(self):
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        with TemporaryDirectory() as td:
+            home = Path(td) / "home"
+            unrelated = home / ".hermes"
+            unrelated.mkdir(parents=True)
+            (unrelated / "state.db").write_bytes(b"not-wechat")
+
+            xwechat_root = home / "Library" / "Containers" / "com.tencent.xinWeChat" / "Data" / "Documents" / "xwechat_files"
+            account = xwechat_root / "wxid_demo_suffix"
+            (account / "db_storage").mkdir(parents=True)
+            (account / "db_storage" / "contact.db").write_bytes(b"wechat")
+
+            with (
+                patch.object(wd.sys, "platform", "darwin"),
+                patch.object(wd.Path, "home", return_value=home),
+                patch.object(
+                    wd,
+                    "_build_auto_detect_scan_paths",
+                    return_value=[str(home), str(xwechat_root)],
+                ),
+                patch.object(wd, "get_process_list", return_value=[]),
+            ):
+                detected_dirs = wd.auto_detect_wechat_data_dirs()
+                accounts = wd.detect_wechat_accounts_from_data_root()
+
+            self.assertEqual(detected_dirs, [str(xwechat_root)])
+            self.assertEqual([item["account_name"] for item in accounts], ["wxid_demo_suffix"])
+
 
 if __name__ == "__main__":
     unittest.main()

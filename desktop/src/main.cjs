@@ -56,6 +56,7 @@ const {
   ensurePrivatePkiIssuerCached,
 } = require("./windows-private-pki-runtime.cjs");
 const { ensureMacosPrivatePkiTrust } = require("./macos-private-pki-runtime.cjs");
+const { isSameOriginNavigationAbort } = require("./window-load.cjs");
 
 const DEFAULT_BACKEND_HOST = "127.0.0.1";
 const LAN_BACKEND_HOST = "0.0.0.0";
@@ -2458,6 +2459,17 @@ async function loadWithRetry(win, url) {
       logMain(
         `[main] loadWithRetry failure attempt=${attempt} elapsedMs=${Date.now() - startedAt} url=${url} error=${err?.message || err}`
       );
+      // Nuxt's agreement middleware redirects a first-time user from `/` to
+      // `/agreement`. Electron 40 reports that successful same-origin client
+      // navigation as ERR_ABORTED, even though the redirected page continues
+      // loading. Treat only a confirmed same-origin abort as a completed load;
+      // genuine network and cross-origin failures still use the retry path.
+      if (isSameOriginNavigationAbort(win, url, err)) {
+        logMain(
+          `[main] loadWithRetry accepted same-origin navigation url=${win.webContents.getURL()}`
+        );
+        return;
+      }
       if (Date.now() - startedAt > 60_000) throw new Error(`Failed to load URL in time: ${url}`);
       await new Promise((r) => setTimeout(r, 500));
     }

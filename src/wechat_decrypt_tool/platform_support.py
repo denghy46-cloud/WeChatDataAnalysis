@@ -115,20 +115,32 @@ def mac_image_scan_library_path() -> Path:
 
 
 def mac_native_core_paths() -> tuple[Path, Path, Path]:
+    source_root = ""
+    if not getattr(sys, "frozen", False):
+        source_root = str(os.environ.get("WCE_NATIVE_CORE_SOURCE_DIR", "") or "").strip()
+
+    def source_file(name: str) -> str:
+        return str(Path(source_root).expanduser() / name) if source_root else ""
+
     return (
         _first_existing_native_resource(
             Path("libwechatdb_client.dylib"),
-            explicit=str(
-                os.environ.get("WECHAT_TOOL_NATIVE_CORE_LIBRARY", "") or ""
-            ).strip(),
+            explicit=(
+                str(os.environ.get("WECHAT_TOOL_NATIVE_CORE_LIBRARY", "") or "").strip()
+                or source_file("libwechatdb_client.dylib")
+            ),
         ),
         _first_existing_native_resource(
             Path("wechatdb_broker"),
-            explicit=str(
-                os.environ.get("WECHAT_TOOL_NATIVE_CORE_BROKER", "") or ""
-            ).strip(),
+            explicit=(
+                str(os.environ.get("WECHAT_TOOL_NATIVE_CORE_BROKER", "") or "").strip()
+                or source_file("wechatdb_broker")
+            ),
         ),
-        _first_existing_native_resource(Path("wechatdb_native_build.json")),
+        _first_existing_native_resource(
+            Path("wechatdb_native_build.json"),
+            explicit=source_file("wechatdb_native_build.json"),
+        ),
     )
 
 

@@ -472,6 +472,14 @@ def auto_detect_wechat_data_dirs():
     # - C:\Users\<user>\Documents\WeChat Files
     # - D:\wechatMSG\xwechat_files
     # - D:\abc\wechatMSG\xwechat_files
+    macos_generic_roots: set[str] = set()
+    if sys.platform == "darwin":
+        home = Path.home()
+        macos_generic_roots = {
+            os.path.normcase(os.path.normpath(str(path)))
+            for path in (home, home / "Documents", home / "Desktop", home / "Downloads")
+        }
+
     for scan_path in _build_auto_detect_scan_paths():
         if not os.path.exists(scan_path):
             continue
@@ -504,7 +512,16 @@ def auto_detect_wechat_data_dirs():
 
         # macOS default candidates can already point at the data root even when
         # its version name is unfamiliar to this release.
-        if sys.platform == "darwin" and _contains_wechat_account_dirs(Path(scan_path)):
+        # Generic user roots can contain unrelated application directories with
+        # SQLite files (for example ~/.hermes). They are discovery parents, not
+        # WeChat data roots. Keep the unfamiliar-version fallback only for a
+        # non-generic candidate such as the WeChat container's version folder.
+        normalized_scan_path = os.path.normcase(os.path.normpath(scan_path))
+        if (
+            sys.platform == "darwin"
+            and normalized_scan_path not in macos_generic_roots
+            and _contains_wechat_account_dirs(Path(scan_path))
+        ):
             _append_detected_dir(detected_dirs, scan_path)
 
     # 策略2：进程内存分析（简化版）

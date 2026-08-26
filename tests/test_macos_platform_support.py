@@ -79,6 +79,28 @@ class TestMacosPlatformSupport(unittest.TestCase):
         self.assertIn("wechat_decrypt_tool/native/macos", helper.as_posix())
         self.assertNotIn("WeFlow", helper.as_posix())
 
+    def test_source_runtime_capability_uses_verified_injected_native_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            native_root = Path(temp_dir)
+            client = native_root / "libwechatdb_client.dylib"
+            broker = native_root / "wechatdb_broker"
+            manifest = native_root / "wechatdb_native_build.json"
+            client.write_bytes(b"client")
+            broker.write_bytes(b"broker")
+            manifest.write_text("{}", encoding="utf-8")
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"WCE_NATIVE_CORE_SOURCE_DIR": str(native_root)},
+                    clear=False,
+                ),
+                patch.object(platform_support.sys, "frozen", False, create=True),
+            ):
+                selected = platform_support.mac_native_core_paths()
+
+        self.assertEqual(selected, (client.resolve(), broker.resolve(), manifest.resolve()))
+
     def test_apple_silicon_capabilities_enable_validated_db_key_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             native_root = Path(temp_dir)
