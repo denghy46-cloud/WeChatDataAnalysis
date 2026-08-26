@@ -130,6 +130,7 @@ class VoiceTranscriptionSettingsRequest(BaseModel):
 class VoiceTranscriptionBatchRequest(BaseModel):
     account: Optional[str] = Field(None, description="账号目录名")
     force: bool = Field(False, description="忽略现有 Whisper 缓存并重新识别")
+    engine: StrictStr = Field("local", description="批量转写方式：local 或 wechat-native")
     concurrency: Optional[conint(strict=True, ge=0)] = Field(  # type: ignore[valid-type]
         None,
         description="并发语音数；0 或省略表示自动，正整数不设固定上限",
@@ -1307,7 +1308,9 @@ async def get_chat_avatar(username: str, account: Optional[str] = None, source: 
 
     head_image_db_path = account_dir / "head_image.db"
     if not head_image_db_path.exists():
-        # No local head_image.db: allow fallback from cached/remote URL path.
+        # A direct account may not ship a decrypted head_image.db. Keep the
+        # cache fast path, then treat the local source as empty and continue
+        # to the WCDB/remote fallback below.
         if cached_file is not None and user_entry:
             headers = build_avatar_cache_response_headers(user_entry)
             trace("response:ready", result="user-cache-hit-no-head-image", mediaType=str(user_entry.get("media_type") or ""))
@@ -1316,10 +1319,12 @@ async def get_chat_avatar(username: str, account: Optional[str] = None, source: 
                 media_type=str(user_entry.get("media_type") or "application/octet-stream"),
                 headers=headers,
             )
-        trace("response:error", result="head-image-db-missing")
-        raise HTTPException(status_code=404, detail="head_image.db not found.")
+        trace("head-image:unavailable", result="head-image-db-missing-fallback")
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE head_image (username TEXT, md5 TEXT, image_buffer BLOB, update_time INTEGER)")
+    else:
+        conn = sqlite3.connect(str(head_image_db_path))
 
-    conn = sqlite3.connect(str(head_image_db_path))
     try:
         meta = conn.execute(
             "SELECT md5, update_time FROM head_image WHERE username = ? ORDER BY update_time DESC LIMIT 1",
@@ -3774,17 +3779,22 @@ async def start_chat_voice_transcription_batch(req: VoiceTranscriptionBatchReque
     _require_local_voice_mutation(request)
     account_dir = _resolve_account_dir(req.account)
     try:
+        start_args = {
+            "account": account_dir.name,
+            "account_dir": account_dir,
+            "force": bool(req.force),
+            "concurrency": req.concurrency,
+        }
+        if str(req.engine or "local") != "local":
+            start_args["engine"] = str(req.engine)
         return await asyncio.to_thread(
             VOICE_TRANSCRIPTION_BATCH_MANAGER.start,
-            account=account_dir.name,
-            account_dir=account_dir,
-            force=bool(req.force),
-            concurrency=req.concurrency,
+            **start_args,
         )
     except VoiceTranscriptionError as exc:
         status_code = (
             503
-            if exc.code in {"model_not_ready", "dependency_missing", "disabled"}
+            if exc.code in {"model_not_ready", "dependency_missing", "disabled", "native_not_ready"}
             else 409
             if exc.code in {"batch_busy", "model_busy", "service_retired"}
             else 400

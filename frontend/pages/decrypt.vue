@@ -29,8 +29,8 @@
                 解密密钥 <span class="text-red-500">*</span>
               </label>
 
-              <div class="flex gap-3">
-                <div class="relative flex-1">
+              <div class="flex flex-wrap gap-3">
+                <div class="relative flex-1 min-w-[260px]">
                   <input
                       id="key"
                       v-model="formData.key"
@@ -61,6 +61,14 @@
                   </svg>
                   {{ !platformCapabilitiesLoaded ? '正在检测系统' : (isGettingDbKey ? '获取中...' : '一键获取数据库密钥') }}
                 </button>
+                <button
+                    v-if="isGettingDbKey"
+                    type="button"
+                    @click="cancelDbKeyAcquisition"
+                    class="flex-none inline-flex items-center px-4 py-3 border border-[#FA5151]/40 text-[#C93A3A] rounded-lg text-sm font-medium hover:bg-[#FFF1F1] transition-colors whitespace-nowrap"
+                >
+                  停止并恢复
+                </button>
               </div>
               <p v-if="formErrors.key" class="mt-1 text-sm text-red-600 flex items-center">
                 <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -73,7 +81,7 @@
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
                 </svg>
                 {{ isMacos
-                  ? '点击后将调用本地受控组件；显示“获取中”后，请完整退出微信程序，再立即重新打开并登录。WCDA 会自动跟随重启后的微信进程，密钥不会上传。'
+                  ? '优先调用本地受控组件；仅在明确失败且您再次确认后，才提供实验性本机调试兜底。获取接口仅允许本机访问。'
                   : '点击按钮将优先使用 V4 内存扫描获取【数据库解密密钥】；失败时会询问您是否改用 Hook。您也可以手动输入已知的64位密钥。' }}
               </p>
               <p v-if="!isMacos" class="mt-2 text-xs text-[#7F7F7F] flex items-start">
@@ -111,7 +119,7 @@
                 id="dbPath"
                 v-model="formData.db_storage_path"
                 type="text"
-                :placeholder="isMacos ? '例如: /Users/你的用户名/.../wxid_xxx/db_storage' : '例如: D:\\wechatMSG\\xwechat_files\\wxid_xxx\\db_storage'"
+                :placeholder="isMacos ? '例如: /Users/你的用户名/.../<账号目录>/db_storage（账号目录可能是 wxid_... 或自定义名称）' : '例如: D:\\wechatMSG\\xwechat_files\\wxid_xxx\\db_storage'"
                 class="w-full px-4 py-3 bg-white border border-[#EDEDED] rounded-lg font-mono text-sm focus:outline-none focus:ring-2 focus:ring-[#07C160] focus:border-transparent transition-all duration-200"
                 :class="{ 'border-red-500': formErrors.db_storage_path }"
                 required
@@ -792,6 +800,41 @@
           </div>
 
           <template v-else>
+            <div class="mt-5 rounded-xl border border-[var(--app-border)] bg-[var(--app-surface-bg)] p-4">
+              <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h3 class="text-sm font-semibold text-[var(--app-text-primary)]">选择推理设备</h3>
+                  <p class="mt-1 text-xs text-[var(--app-text-muted)]">CPU 兼容所有设备；NVIDIA GPU 使用 CUDA 加速，失败会自动回退 CPU。</p>
+                </div>
+                <div class="flex shrink-0 overflow-hidden rounded-md border border-[var(--app-border)]" role="radiogroup" aria-label="语音转文字推理设备">
+                  <button
+                    type="button"
+                    role="radio"
+                    data-testid="voice-onboarding-device-cpu"
+                    :aria-checked="voiceOnboardingRequestedDevice === 'cpu'"
+                    :class="voiceOnboardingRequestedDevice === 'cpu' ? 'bg-[var(--app-surface-muted)] text-[var(--app-accent)]' : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-neutral-btn-hover)]'"
+                    :disabled="voiceOnboardingDeviceBusy || voiceOnboardingLoading || voiceBatchRunning || voiceModelBusy || voiceOnboardingDeviceLocked"
+                    class="px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50"
+                    @click="setVoiceOnboardingDevice('cpu')"
+                  >CPU</button>
+                  <button
+                    type="button"
+                    role="radio"
+                    data-testid="voice-onboarding-device-cuda"
+                    :aria-checked="voiceOnboardingRequestedDevice === 'cuda'"
+                    :class="voiceOnboardingRequestedDevice === 'cuda' ? 'bg-[var(--app-surface-muted)] text-[var(--app-accent)]' : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-neutral-btn-hover)]'"
+                    :disabled="voiceOnboardingDeviceBusy || voiceOnboardingLoading || voiceBatchRunning || voiceModelBusy || voiceOnboardingDeviceLocked || !voiceOnboardingCudaAvailable"
+                    :title="voiceOnboardingCudaAvailable ? '使用 NVIDIA CUDA 加速' : (voiceOnboardingCudaReason || '未检测到可用的 NVIDIA CUDA 设备')"
+                    class="border-l border-[var(--app-border)] px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50"
+                    @click="setVoiceOnboardingDevice('cuda')"
+                  >NVIDIA GPU</button>
+                </div>
+              </div>
+              <p v-if="voiceOnboardingDeviceLocked" class="mt-2 text-xs text-[var(--app-text-secondary)]">推理设备由 WECHAT_TOOL_WHISPER_DEVICE 环境变量固定，无法在这里切换。</p>
+              <p v-else-if="voiceOnboardingStatus?.fallbackReason" class="mt-2 text-xs text-[var(--app-text-secondary)]">{{ voiceOnboardingStatus.fallbackReason }}</p>
+              <p v-else-if="!voiceOnboardingCudaAvailable && voiceOnboardingCudaReason" class="mt-2 text-xs text-[var(--app-text-secondary)]">{{ voiceOnboardingCudaReason }}</p>
+            </div>
+
             <div class="mt-5">
               <div class="mb-2 flex items-center justify-between">
                 <h3 class="text-sm font-semibold text-[var(--app-text-primary)]">选择模型</h3>
@@ -950,18 +993,21 @@
               class="inline-flex items-center px-5 py-2.5 border border-[#E8C6C6] text-[#C83C3C] rounded-lg font-medium hover:bg-[#FFF5F5]"
             >停止转换</button>
             <button
-              v-else-if="voiceOnboardingBatch?.status === 'done'"
-              type="button"
-              @click="skipToChat"
-              class="inline-flex items-center px-6 py-2.5 bg-[#07C160] text-white rounded-lg font-medium hover:bg-[#06AD56]"
-            >完成并查看聊天记录</button>
-            <button
               v-else
               type="button"
-              :disabled="!voiceOnboardingStatus?.available || voiceModelBusy || voiceOnboardingLoading"
-              @click="startVoiceOnboardingBatch"
+              :disabled="!voiceOnboardingStatus?.available || voiceModelBusy || voiceOnboardingLoading || voiceOnboardingDeviceBusy"
+              @click="startVoiceOnboardingBatch('local')"
               class="inline-flex items-center px-6 py-2.5 bg-[#07C160] text-white rounded-lg font-medium hover:bg-[#06AD56] disabled:cursor-not-allowed disabled:opacity-50"
-            >提前转换全部语音</button>
+            >{{ voiceOnboardingBatch?.status === 'done' ? '再次扫描全部语音' : '本地批量转文字' }}</button>
+            <button
+              v-if="!voiceBatchRunning"
+              type="button"
+              :disabled="!voiceNativeAvailable || voiceModelBusy || voiceOnboardingLoading || voiceOnboardingDeviceBusy"
+              :title="voiceNativeAvailable ? '逐条调用微信原生转写，任务会串行执行' : (voiceNativeReason || '微信原生转写当前不可用')"
+              @click="startVoiceOnboardingBatch('wechat-native')"
+              class="inline-flex items-center px-6 py-2.5 border border-[#07C160] text-[#078A45] rounded-lg font-medium hover:bg-[#F0F8F2] disabled:cursor-not-allowed disabled:opacity-50"
+            >微信原生批量转文字</button>
+            <p v-if="!voiceNativeAvailable && voiceNativeReason" class="basis-full text-xs text-[#A06A19]">{{ voiceNativeReason }}</p>
           </div>
         </div>
       </div>
@@ -1046,11 +1092,18 @@ const {
   saveMediaKeys,
   getSavedKeys,
   getKeys,
+  getMacosKeyCaptureStatus,
+  prepareMacosKeyCapture,
+  preflightMacosKeyCapture,
+  captureMacosKey,
+  cancelMacosKeyCapture,
   getImageKey,
   getImageKeyMemory,
   getWxStatus,
   getPlatformCapabilities,
   getVoiceTranscriptionStatus,
+  getNativeVoiceTranscriptionStatus,
+  setVoiceTranscriptionDevice,
   setVoiceTranscriptionModel,
   downloadVoiceTranscriptionModel,
   getVoiceTranscriptionModelDownload,
@@ -1072,6 +1125,9 @@ const activeKeyAccount = ref('')
 const isGettingDbKey = ref(false)
 let dbKeyRequestRevision = 0
 let dbKeyRequestController = null
+const macosKeyCapturePrepared = ref(false)
+const macosKeyCaptureOwnedByPage = ref(false)
+const macosKeyCaptureCleanupInFlight = ref(false)
 const platformCapabilities = ref({ platform: '' })
 const platformCapabilitiesLoaded = ref(false)
 const autoPrepareRequested = ref(false)
@@ -1140,12 +1196,14 @@ const steps = [
 ]
 
 const voiceOnboardingStatus = ref(null)
+const voiceNativeStatus = ref(null)
 const voiceOnboardingBatch = ref(null)
 const voiceBatchConcurrency = ref(0)
 const voiceBatchConcurrencyDraft = ref('0')
 const voiceBatchConcurrencyError = ref('')
 const voiceBatchConcurrencyBadInput = ref(false)
 const voiceOnboardingLoading = ref(false)
+const voiceOnboardingDeviceBusy = ref(false)
 const voiceOnboardingError = ref('')
 const voiceOnboardingMessage = ref('')
 const voiceModelAction = ref({ id: '', type: '' })
@@ -1229,11 +1287,17 @@ const voiceModelBusy = computed(() => (
   || voiceModelDeletePendingIds.value.length > 0
   || voiceOnboardingModels.value.some((model) => isVoiceModelDownloading(model) || isVoiceModelDeleting(model))
 ))
-const voiceOnboardingDeviceText = computed(() => {
+const voiceOnboardingRequestedDevice = computed(() => {
   const device = String(voiceOnboardingStatus.value?.requestedDevice || voiceOnboardingStatus.value?.device || 'cpu')
-  return device === 'cuda' ? 'NVIDIA GPU' : 'CPU'
+  return device === 'cuda' ? 'cuda' : 'cpu'
 })
+const voiceOnboardingDeviceText = computed(() => voiceOnboardingRequestedDevice.value === 'cuda' ? 'NVIDIA GPU' : 'CPU')
+const voiceOnboardingDeviceLocked = computed(() => String(voiceOnboardingStatus.value?.deviceSource || '') === 'env')
+const voiceOnboardingCudaAvailable = computed(() => voiceOnboardingStatus.value?.cuda?.available === true)
+const voiceOnboardingCudaReason = computed(() => String(voiceOnboardingStatus.value?.cuda?.reason || '').trim())
 const voiceBatchRunning = computed(() => ['queued', 'running'].includes(String(voiceOnboardingBatch.value?.status || '')))
+const voiceNativeAvailable = computed(() => voiceNativeStatus.value?.available === true)
+const voiceNativeReason = computed(() => String(voiceNativeStatus.value?.reason || '').trim())
 const normalizeVoiceBatchConcurrency = (value) => {
   const concurrency = Number(value)
   return Number.isInteger(concurrency) && concurrency >= 0 ? concurrency : 0
@@ -1285,6 +1349,7 @@ const voiceOnboardingModelLocked = computed(() => String(voiceOnboardingStatus.v
 const voiceOnboardingModelDisabled = (model) => (
   !model?.id
   || voiceModelBusy.value
+  || voiceOnboardingDeviceBusy.value
   || voiceOnboardingLoading.value
   || voiceBatchRunning.value
   || ['queued', 'running'].includes(String(model?.downloadStatus || ''))
@@ -1910,14 +1975,42 @@ const waitForDbKeyDelay = (milliseconds, signal) => new Promise((resolve, reject
   signal.addEventListener('abort', onAbort, { once: true })
 })
 
+const macosKeyCapturePayload = () => ({
+  wechat_install_path: String(formData.wechat_install_path || '').trim() || null,
+  db_storage_path: String(formData.db_storage_path || '').trim() || null,
+  timeout: 240
+})
+
+const cleanupMacosKeyCapture = async ({ silent = false } = {}) => {
+  if (!isMacos.value || macosKeyCaptureCleanupInFlight.value) return false
+  macosKeyCaptureCleanupInFlight.value = true
+  try {
+    const response = await cancelMacosKeyCapture(macosKeyCapturePayload())
+    if (response?.status === 0) {
+      macosKeyCapturePrepared.value = false
+      macosKeyCaptureOwnedByPage.value = false
+      if (!silent) warning.value = '实验性密钥获取已停止，并已校验恢复腾讯官方签名微信。'
+      return true
+    }
+    if (!silent) error.value = response?.errmsg || '停止实验性密钥获取失败，请不要启动微信并查看日志。'
+    return false
+  } catch (cleanupError) {
+    if (!silent) error.value = cleanupError?.message || '停止实验性密钥获取失败，请不要启动微信并查看日志。'
+    return false
+  } finally {
+    macosKeyCaptureCleanupInFlight.value = false
+  }
+}
+
 const cancelDbKeyAcquisition = () => {
-  if (!dbKeyRequestController && !isGettingDbKey.value) return
+  if (!dbKeyRequestController && !isGettingDbKey.value && !macosKeyCaptureOwnedByPage.value) return
 
   dbKeyRequestRevision += 1
   const controller = dbKeyRequestController
   dbKeyRequestController = null
   controller?.abort()
   isGettingDbKey.value = false
+  if (macosKeyCaptureOwnedByPage.value) void cleanupMacosKeyCapture({ silent: true })
 }
 
 const showDbKeyPersistenceWarning = (result) => {
@@ -1937,102 +2030,231 @@ const openAutomaticallyPreparedAccount = async () => {
   await navigateTo('/chat')
 }
 
+const runMacosLldbFallback = async ({ requestRevision, requestController, helperError }) => {
+  const riskAccepted = await requestGuideDialog({
+    eyebrow: '实验性兜底方式',
+    title: '受控组件失败，是否改用本机调试兜底？',
+    description: '该方式会在管理员授权后临时重签默认路径中的微信，并在成功、失败或停止时恢复已校验的腾讯官方版本。',
+    errorMessage: helperError ? `受控组件未能获取密钥：${helperError}` : '',
+    details: [
+      '仅支持 /Applications/WeChat.app 与 Apple Silicon Mac',
+      '操作前会在应用输出目录创建并校验官方微信备份',
+      '临时重签和调试可能触发微信安全提醒，无法承诺零风险或百分之百成功',
+      '不要强制退出 WCDA；需要停止时请使用“停止并恢复”或返回操作'
+    ],
+    note: '这是显式确认后的实验性兜底，不会在受控组件正常时自动启用。',
+    primaryLabel: '了解风险，继续',
+    secondaryLabel: '暂不使用',
+    tone: 'warning'
+  })
+  if (!isDbKeyRequestActive(requestRevision, requestController) || !riskAccepted) return false
+
+  warning.value = '正在备份并准备临时调试微信，期间可能出现管理员授权窗口。'
+  let response = await prepareMacosKeyCapture({
+    ...macosKeyCapturePayload(),
+    signal: requestController.signal
+  })
+  if (!isDbKeyRequestActive(requestRevision, requestController)) {
+    if (response?.status === 0) {
+      macosKeyCapturePrepared.value = true
+      macosKeyCaptureOwnedByPage.value = true
+      await cleanupMacosKeyCapture({ silent: true })
+    }
+    return false
+  }
+  if (response?.status !== 0) {
+    error.value = response?.errmsg || '无法准备临时调试微信。'
+    warning.value = ''
+    return false
+  }
+  macosKeyCapturePrepared.value = true
+  macosKeyCaptureOwnedByPage.value = true
+
+  const loggedIn = await requestGuideDialog({
+    eyebrow: '步骤 1 / 3',
+    title: '请先登录临时微信并进入聊天页',
+    description: '现在只完成登录，不要退出账号。进入任意聊天页面后再继续，系统会先检查断点是否适配当前微信版本。',
+    details: [
+      '如果微信要求手机确认或验证码，请先完整完成',
+      '确认桌面微信已进入主聊天界面',
+      '此阶段尚未开始读取登录密钥'
+    ],
+    note: '选择停止会立即尝试恢复腾讯官方版本。',
+    primaryLabel: '已进入聊天，开始预检',
+    secondaryLabel: '停止并恢复',
+    tone: 'guide'
+  })
+  if (!isDbKeyRequestActive(requestRevision, requestController) || !loggedIn) {
+    await cleanupMacosKeyCapture({ silent: !isDbKeyRequestActive(requestRevision, requestController) })
+    return false
+  }
+
+  warning.value = '正在短暂检查本机捕获点，完成后会立即脱离。'
+  response = await preflightMacosKeyCapture({
+    ...macosKeyCapturePayload(),
+    signal: requestController.signal
+  })
+  if (!isDbKeyRequestActive(requestRevision, requestController)) {
+    await cleanupMacosKeyCapture({ silent: true })
+    return false
+  }
+  if (response?.status !== 0) {
+    macosKeyCapturePrepared.value = response?.data?.needs_cleanup === true
+    macosKeyCaptureOwnedByPage.value = macosKeyCapturePrepared.value
+    error.value = response?.errmsg || '当前微信版本未通过本机捕获点预检，已停止并恢复。'
+    warning.value = ''
+    if (macosKeyCapturePrepared.value) await cleanupMacosKeyCapture({ silent: true })
+    return false
+  }
+
+  const loggedOut = await requestGuideDialog({
+    eyebrow: '步骤 2 / 3',
+    title: '请在临时微信中退出当前账号',
+    description: '退出到二维码登录界面后不要重新扫码；回到这里点击开始监测，再用手机确认登录。',
+    details: [
+      '必须使用微信菜单中的“退出登录”，不要关闭微信窗口',
+      '看到二维码后先回到 WCDA 点击“开始监测”',
+      '监测启动后再扫码或在手机上确认同一账号登录'
+    ],
+    note: '捕获只针对这次重新登录计算，并使用所选账号数据库实时校验结果。',
+    primaryLabel: '已看到二维码，开始监测',
+    secondaryLabel: '停止并恢复',
+    tone: 'warning'
+  })
+  if (!isDbKeyRequestActive(requestRevision, requestController) || !loggedOut) {
+    await cleanupMacosKeyCapture({ silent: !isDbKeyRequestActive(requestRevision, requestController) })
+    return false
+  }
+
+  warning.value = '正在等待管理员授权并启动本机监测；显示“监测已就绪”前请不要登录微信。'
+  const captureOutcomePromise = captureMacosKey({
+    ...macosKeyCapturePayload(),
+    signal: requestController.signal
+  }).then(
+    captureResponse => ({ response: captureResponse, captureError: null }),
+    captureError => ({ response: null, captureError })
+  )
+  let captureOutcome = null
+  let monitorReady = false
+  while (isDbKeyRequestActive(requestRevision, requestController) && !captureOutcome && !monitorReady) {
+    captureOutcome = await Promise.race([
+      captureOutcomePromise,
+      waitForDbKeyDelay(350, requestController.signal).then(() => null)
+    ])
+    if (captureOutcome) break
+    try {
+      const statusResponse = await getMacosKeyCaptureStatus({ signal: requestController.signal })
+      monitorReady = statusResponse?.status === 0 && statusResponse?.data?.monitor_ready === true
+    } catch (statusError) {
+      if (statusError?.name === 'AbortError') throw statusError
+    }
+  }
+  if (!isDbKeyRequestActive(requestRevision, requestController)) {
+    await cleanupMacosKeyCapture({ silent: true })
+    return false
+  }
+  if (monitorReady) {
+    warning.value = '监测已就绪：现在请扫码或在手机上确认登录，完成前不要关闭微信或 WCDA。'
+  }
+  if (!captureOutcome) captureOutcome = await captureOutcomePromise
+  if (captureOutcome.captureError) throw captureOutcome.captureError
+  response = captureOutcome.response
+  macosKeyCapturePrepared.value = response?.data?.needs_cleanup === true
+  macosKeyCaptureOwnedByPage.value = macosKeyCapturePrepared.value
+  const key = String(response?.data?.db_key || '').trim().toLowerCase()
+  if (
+    response?.status === 0
+    && response?.data?.validated === true
+    && response?.data?.key_saved === true
+    && /^[0-9a-f]{64}$/.test(key)
+  ) {
+    macosKeyCapturePrepared.value = false
+    macosKeyCaptureOwnedByPage.value = false
+    formData.key = key
+    warning.value = response?.data?.official_wechat_verified
+      ? '数据库密钥已通过完整校验并显示在输入框中，腾讯官方签名微信已恢复。'
+      : '数据库密钥已获取、通过完整校验并显示在输入框中。'
+    return true
+  }
+  error.value = response?.errmsg || '实验性本机调试未能获取可验证的数据库密钥。'
+  warning.value = ''
+  if (macosKeyCapturePrepared.value) await cleanupMacosKeyCapture({ silent: true })
+  return false
+}
+
 const handleGetDbKey = async () => {
   if (isGettingDbKey.value) return
 
   if (isMacos.value) {
+    if (macosKeyCapturePrepared.value && !macosKeyCaptureOwnedByPage.value) {
+      await recoverPendingMacosKeyCapture()
+      if (macosKeyCapturePrepared.value) return
+    }
     formData.key = ''
     formErrors.key = ''
 
-    const privateHelperAvailable = platformCapabilities.value?.database_key_private_helper === true
-    const resignCaptureAvailable = platformCapabilities.value?.database_key_resign_capture === true
-    if (
-      platformCapabilities.value?.database_key_extraction !== true
-      || (!privateHelperAvailable && !resignCaptureAvailable)
-    ) {
-      error.value = platformCapabilities.value?.database_key_guidance || 'macOS 数据库密钥组件不可用，请更新或重新安装正式版本。'
+    const helperAvailable = platformCapabilities.value?.database_key_extraction === true
+    const lldbFallbackAvailable = platformCapabilities.value?.macos_lldb_fallback === true
+    if (!helperAvailable && !lldbFallbackAvailable) {
+      error.value = platformCapabilities.value?.database_key_guidance
+        || platformCapabilities.value?.macos_lldb_fallback_note
+        || '当前 Mac 没有可用的数据库密钥获取方式。'
       return
     }
-
-    const confirmTemporaryResign = () => requestGuideDialog({
-      eyebrow: 'macOS 临时重签方案',
-      title: '确认临时替换微信并在登录时捕获密钥',
-      description: '该方案会退出微信，保留并校验腾讯官方原版，临时启用可调试副本；捕获结束、失败、取消或下次启动 WCDA 时都会优先恢复官方原版。',
-      details: [
-        'SIP 保持开启，不会代填或保存管理员密码',
-        'macOS 可能询问临时微信访问原数据容器的权限，请选择允许',
-        '临时微信打开后，请在二维码页面重新登录当前数据库所属账号',
-        '整个过程请勿移动、更新或手动替换 /Applications/WeChat.app'
-      ],
-      note: '这是实验性方案。开始前会校验官方签名并创建第二份恢复副本；密钥只在本机内存中捕获并立即用当前消息库、会话库验真。',
-      primaryLabel: '开始临时重签捕获',
-      secondaryLabel: '取消',
-      tone: 'warning'
-    })
 
     const requestRevision = ++dbKeyRequestRevision
     const requestController = new AbortController()
     dbKeyRequestController = requestController
     isGettingDbKey.value = true
     error.value = ''
+    warning.value = helperAvailable
+      ? '受控组件捕获已开始：现在请完整退出微信程序，再立即重新打开并登录；请勿关闭 WCDA 或当前页面。'
+      : ''
 
     try {
-      let keyMode = privateHelperAvailable ? 'macos_private_helper' : 'macos_resign_lldb'
-      if (keyMode === 'macos_resign_lldb') {
-        const confirmed = await confirmTemporaryResign()
-        if (!confirmed || !isDbKeyRequestActive(requestRevision, requestController)) return
-      }
-      warning.value = keyMode === 'macos_resign_lldb'
-        ? '正在创建恢复副本并启动临时微信。窗口出现后请重新登录目标账号；不要关闭 WCDA。'
-        : '捕获已开始：现在请完整退出微信程序，再立即重新打开并登录；WCDA 会自动挂接重启后的微信进程，请勿关闭 WCDA 或当前页面。'
-
-      let res = await getKeys({
-        db_storage_path: String(formData.db_storage_path || '').trim(),
-        key_mode: keyMode,
-        signal: requestController.signal
-      })
+      const res = helperAvailable
+        ? await getKeys({
+            db_storage_path: String(formData.db_storage_path || '').trim(),
+            key_mode: 'macos_private_helper',
+            signal: requestController.signal
+          })
+        : {
+            status: -1,
+            errmsg: platformCapabilities.value?.database_key_guidance || 'macOS 受控组件当前不可用。',
+            data: { can_fallback_to_macos_lldb: lldbFallbackAvailable }
+          }
       if (!isDbKeyRequestActive(requestRevision, requestController)) return
-
-      if (
-        res?.status !== 0
-        && res?.data?.error_code === 'TARGET_PROCESS_PROTECTED'
-        && resignCaptureAvailable
-      ) {
-        const confirmed = await confirmTemporaryResign()
-        if (!confirmed || !isDbKeyRequestActive(requestRevision, requestController)) {
-          error.value = res?.errmsg || '当前正式签名微信禁止调试附加。'
-          warning.value = ''
-          return
-        }
-        keyMode = 'macos_resign_lldb'
-        error.value = ''
-        warning.value = '正在创建恢复副本并启动临时微信。窗口出现后请重新登录目标账号；不要关闭 WCDA。'
-        res = await getKeys({
-          db_storage_path: String(formData.db_storage_path || '').trim(),
-          key_mode: keyMode,
-          signal: requestController.signal
-        })
-        if (!isDbKeyRequestActive(requestRevision, requestController)) return
-      }
 
       const key = String(res?.data?.db_key || '').trim().toLowerCase()
       if (res?.status === 0 && /^[0-9a-f]{64}$/.test(key)) {
         formData.key = key
-        warning.value = keyMode === 'macos_resign_lldb'
-          ? '数据库密钥已捕获并验真，腾讯官方微信也已恢复！'
-          : '数据库解密密钥已通过 macOS 本地受控组件获取成功！'
+        warning.value = '数据库解密密钥已通过 macOS 本地受控组件获取成功！'
         setTimeout(() => {
           if (
             requestRevision === dbKeyRequestRevision
             && warning.value.includes('获取成功')
           ) warning.value = ''
         }, 3000)
+      } else if (
+        lldbFallbackAvailable
+        && (res?.data?.can_fallback_to_macos_lldb === true || !helperAvailable)
+      ) {
+        warning.value = ''
+        await runMacosLldbFallback({
+          requestRevision,
+          requestController,
+          helperError: res?.errmsg || '受控组件当前不可用'
+        })
       } else {
         error.value = res?.errmsg || 'macOS 数据库密钥获取失败，请重新点击获取并按提示退出、重启微信。'
         warning.value = ''
       }
     } catch (e) {
-      if (!isDbKeyRequestActive(requestRevision, requestController) || e?.name === 'AbortError') return
+      if (!isDbKeyRequestActive(requestRevision, requestController) || e?.name === 'AbortError') {
+        if (macosKeyCapturePrepared.value) await cleanupMacosKeyCapture({ silent: true })
+        return
+      }
+      if (macosKeyCapturePrepared.value) await cleanupMacosKeyCapture({ silent: true })
       error.value = e?.message || 'macOS 数据库密钥获取失败，请稍后重试。'
       warning.value = ''
     } finally {
@@ -2927,12 +3149,14 @@ const refreshVoiceOnboarding = async ({ preserveError = false } = {}) => {
   voiceOnboardingLoading.value = true
   if (!preserveError) voiceOnboardingError.value = ''
   try {
-    const [status, batch] = await Promise.all([
+    const [status, batch, nativeStatus] = await Promise.all([
       getVoiceTranscriptionStatus(),
       getLatestVoiceTranscriptionBatch(mediaAccount.value || ''),
+      mediaAccount.value ? getNativeVoiceTranscriptionStatus({ account: mediaAccount.value }) : Promise.resolve(null),
     ])
     if (!isVoiceOnboardingLifecycleActive(lifecycleEpoch) || refreshRevision !== voiceOnboardingRefreshRevision) return
     applyVoiceOnboardingStatus(status, { observationEpochs })
+    voiceNativeStatus.value = nativeStatus
     applyVoiceOnboardingBatch(batch)
     if (['queued', 'running'].includes(String(batch?.status || '')) && batch?.jobId) {
       void pollVoiceOnboardingBatch(batch.jobId, lifecycleEpoch)
@@ -2944,6 +3168,35 @@ const refreshVoiceOnboarding = async ({ preserveError = false } = {}) => {
     if (isVoiceOnboardingLifecycleActive(lifecycleEpoch) && refreshRevision === voiceOnboardingRefreshRevision) {
       voiceOnboardingLoading.value = false
     }
+  }
+}
+
+const setVoiceOnboardingDevice = async (device) => {
+  const lifecycleEpoch = voiceOnboardingLifecycleEpoch
+  const next = String(device || '').trim().toLowerCase()
+  if (
+    !isVoiceOnboardingLifecycleActive(lifecycleEpoch)
+    || !['cpu', 'cuda'].includes(next)
+    || next === voiceOnboardingRequestedDevice.value
+    || (next === 'cuda' && !voiceOnboardingCudaAvailable.value)
+    || voiceOnboardingDeviceBusy.value
+    || voiceOnboardingLoading.value
+    || voiceBatchRunning.value
+    || voiceModelBusy.value
+    || voiceOnboardingDeviceLocked.value
+  ) return
+
+  voiceOnboardingDeviceBusy.value = true
+  voiceOnboardingError.value = ''
+  try {
+    const response = await setVoiceTranscriptionDevice(next)
+    if (!isVoiceOnboardingLifecycleActive(lifecycleEpoch)) return
+    applyVoiceOnboardingStatus(response?.configuration || response)
+  } catch (e) {
+    if (!isVoiceOnboardingLifecycleActive(lifecycleEpoch)) return
+    voiceOnboardingError.value = String(e?.message || '设置语音转文字推理设备失败')
+  } finally {
+    if (isVoiceOnboardingLifecycleActive(lifecycleEpoch)) voiceOnboardingDeviceBusy.value = false
   }
 }
 
@@ -3096,12 +3349,13 @@ const removeVoiceOnboardingModel = async (model) => {
   }
 }
 
-const startVoiceOnboardingBatch = async () => {
+const startVoiceOnboardingBatch = async (engine = 'local') => {
   const lifecycleEpoch = voiceOnboardingLifecycleEpoch
   if (
     !isVoiceOnboardingLifecycleActive(lifecycleEpoch)
-    || !voiceOnboardingStatus.value?.available
+    || (engine === 'local' ? !voiceOnboardingStatus.value?.available : !voiceNativeAvailable.value)
     || voiceBatchRunning.value
+    || voiceOnboardingDeviceBusy.value
     || !commitVoiceBatchConcurrency()
   ) return
   voiceOnboardingError.value = ''
@@ -3110,6 +3364,7 @@ const startVoiceOnboardingBatch = async () => {
       account: mediaAccount.value || null,
       force: false,
       concurrency: voiceBatchConcurrency.value,
+      engine,
     })
     if (!isVoiceOnboardingLifecycleActive(lifecycleEpoch)) return
     applyVoiceOnboardingBatch(job)
@@ -3161,8 +3416,12 @@ const confirmBackFromRunningStep = () => {
     : currentStep.value === 0 && isGettingDbKey.value
       ? {
           title: '数据库密钥仍在获取',
-          description: '返回账号选择会停止当前页面等待结果；如果 Hook 已经开始，微信重启或登录流程仍可能继续完成。',
-          details: ['页面将不再接收本次密钥结果', '已经启动的 Hook 操作无法保证立即停止']
+          description: isMacos.value
+            ? '返回账号选择会停止当前获取；如果已进入本机调试兜底，系统会同时尝试恢复腾讯官方签名微信。'
+            : '返回账号选择会停止当前页面等待结果；如果 Hook 已经开始，微信重启或登录流程仍可能继续完成。',
+          details: isMacos.value
+            ? ['页面将不再接收本次密钥结果', '恢复完成前请不要手动启动或更新微信']
+            : ['页面将不再接收本次密钥结果', '已经启动的 Hook 操作无法保证立即停止']
         }
     : currentStep.value === 2 && mediaDecrypting.value
       ? { title: '图片仍在解密', description: '返回填写图片密钥会停止当前图片解密，已经完成的图片会保留。' }
@@ -3318,6 +3577,37 @@ const skipToChat = async () => {
   navigateTo('/chat')
 }
 
+const recoverPendingMacosKeyCapture = async () => {
+  if (!isMacos.value) return
+  try {
+    const response = await getMacosKeyCaptureStatus()
+    if (response?.status !== 0 || response?.data?.pending !== true) return
+    macosKeyCapturePrepared.value = true
+    macosKeyCaptureOwnedByPage.value = false
+    const shouldRestore = await requestGuideDialog({
+      eyebrow: '安全恢复',
+      title: '检测到上次未完成的临时调试微信',
+      description: '恢复状态仍在本机。建议先校验并恢复腾讯官方签名微信，再开始新的密钥获取。',
+      details: [
+        `上次停止阶段：${String(response?.data?.stage || 'unknown')}`,
+        '恢复只使用上次已记录并校验的备份事务',
+        '恢复完成前不要启动或更新微信'
+      ],
+      note: 'WCDA 不会静默覆盖微信，需要您明确确认恢复。',
+      primaryLabel: '立即恢复官方版本',
+      secondaryLabel: '暂不处理',
+      tone: 'warning'
+    })
+    if (shouldRestore) {
+      await cleanupMacosKeyCapture()
+    } else {
+      warning.value = '仍有未完成的临时调试微信恢复状态；恢复前不会开始新的本机调试获取。'
+    }
+  } catch (statusError) {
+    logDecryptDebug('macos-key-capture:status-error', { error: formatLogError(statusError) })
+  }
+}
+
 // 页面加载时检查是否有选中的账户
 onMounted(async () => {
   if (process.client && typeof window !== 'undefined') {
@@ -3339,6 +3629,7 @@ onMounted(async () => {
     } finally {
       platformCapabilitiesLoaded.value = true
     }
+    await recoverPendingMacosKeyCapture()
     formData.wechat_install_path = readStoredWechatInstallPath()
     const selectedAccount = sessionStorage.getItem('selectedAccount')
     logDecryptDebug('mounted:selected-account-raw', { raw: selectedAccount || '' })

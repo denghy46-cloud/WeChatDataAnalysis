@@ -1,4 +1,11 @@
 import { reportServerError } from '~/lib/server-error-logging'
+import {
+  getLatestResourceTiming,
+  isChatPerfLoggingEnabled,
+  logPerfChannel,
+  nowPerfMs,
+  resolveResourceTimingUrl
+} from '~/lib/chat/perf-logger'
 import { useChatAccountsStore } from '~/stores/chatAccounts'
 
 const chatContactsListCache = new Map()
@@ -41,10 +48,33 @@ export const useApi = () => {
   
   // 基础请求函数
   const request = async (url, options = {}) => {
+    const fetchOptions = { ...options }
+    const perfTraceId = String(fetchOptions.perfTraceId || '').trim()
+    delete fetchOptions.perfTraceId
+    const perfEnabled = !!perfTraceId && isChatPerfLoggingEnabled()
+    const resourceUrl = perfEnabled ? resolveResourceTimingUrl(baseURL, url) : ''
+    const sentEpochMs = perfEnabled ? Date.now() : 0
+    const requestStartedAt = perfEnabled ? nowPerfMs() : 0
+    let requestError = ''
+
+    if (perfEnabled) {
+      try { performance.setResourceTimingBufferSize?.(5000) } catch {}
+      const headers = new Headers(fetchOptions.headers || undefined)
+      headers.set('X-WCDA-Perf-Trace', perfTraceId)
+      headers.set('X-WCDA-Perf-Sent-Ms', String(sentEpochMs))
+      fetchOptions.headers = headers
+      logPerfChannel('chat-api', 'request:dispatch', {
+        traceId: perfTraceId,
+        requestUrl: resourceUrl,
+        sentEpochMs,
+        requestStartedAtMs: Number(requestStartedAt.toFixed(1))
+      })
+    }
+
     try {
       const response = await $fetch(url, {
         baseURL,
-        ...options,
+        ...fetchOptions,
         async onResponseError({ response }) {
           if (response.status >= 400 && response.status < 500) {
             const fallback = response.status === 400
@@ -70,10 +100,24 @@ export const useApi = () => {
       chatAccounts.applySourceResponse(response)
       return response
     } catch (error) {
+      requestError = String(error?.message || error?.name || 'request failed')
       if (!isAbortRequestError(error)) {
         console.error('API请求错误:', error)
       }
       throw error
+    } finally {
+      if (perfEnabled) {
+        const timing = getLatestResourceTiming(resourceUrl, { startedAfter: requestStartedAt })
+        logPerfChannel('chat-api', requestError ? 'request:error' : 'request:complete', {
+          traceId: perfTraceId,
+          requestUrl: resourceUrl,
+          sentEpochMs,
+          elapsedMs: Number((nowPerfMs() - requestStartedAt).toFixed(1)),
+          resourceTimingFound: Object.keys(timing).length > 0,
+          ...timing,
+          ...(requestError ? { error: requestError } : {})
+        })
+      }
     }
   }
   
@@ -192,7 +236,10 @@ export const useApi = () => {
     if (params && params.scan_limit != null) query.set('scan_limit', String(params.scan_limit))
     if (params && params.source) query.set('source', params.source)
     const url = '/chat/messages' + (query.toString() ? `?${query.toString()}` : '')
-    return await request(url, params?.signal ? { signal: params.signal } : {})
+    return await request(url, {
+      ...(params?.signal ? { signal: params.signal } : {}),
+      ...(params?.perfTraceId ? { perfTraceId: params.perfTraceId } : {})
+    })
   }
 
   const getChatMessageRaw = async (params = {}) => {
@@ -379,6 +426,12 @@ export const useApi = () => {
     if (params && params.account) query.set('account', params.account)
     if (params && params.max_scan != null) query.set('max_scan', String(params.max_scan))
     if (params && params.force != null) query.set('force', String(params.force))
+    if (params && params.scan_offset != null) query.set('scan_offset', String(params.scan_offset))
+    if (params && Array.isArray(params.usernames) && params.usernames.length > 0) {
+      query.set('usernames', params.usernames.join(','))
+    } else if (params && typeof params.usernames === 'string' && params.usernames) {
+      query.set('usernames', params.usernames)
+    }
     const url = '/sns/realtime/sync_latest' + (query.toString() ? `?${query.toString()}` : '')
     return await request(url, { method: 'POST' })
   }
@@ -583,13 +636,19 @@ export const useApi = () => {
     if (typeof concurrency !== 'number' || !Number.isInteger(concurrency) || concurrency < 0) {
       throw new RangeError('并发线程数必须是非负整数（0 表示自动）')
     }
+    const engine = String(data.engine || 'local').trim().toLowerCase()
+    if (!['local', 'wechat-native'].includes(engine)) {
+      throw new RangeError('不支持的批量转写方式')
+    }
+    const body = {
+      account: data.account || null,
+      force: !!data.force,
+      concurrency
+    }
+    if (engine !== 'local') body.engine = engine
     return await request('/chat/media/voice/transcription/batch', {
       method: 'POST',
-      body: {
-        account: data.account || null,
-        force: !!data.force,
-        concurrency
-      }
+      body
     })
   }
 
@@ -609,7 +668,7 @@ export const useApi = () => {
     })
   }
 
-  // 聊天记录导出（离线zip）
+  // 聊天记录导出（ZIP 全量或增量目录）
   const createChatExport = async (data = {}) => {
     return await request('/chat/exports', {
       method: 'POST',
@@ -632,7 +691,14 @@ export const useApi = () => {
         html_page_size: data.html_page_size != null ? Number(data.html_page_size) : 1000,
         privacy_mode: !!data.privacy_mode,
         file_name: data.file_name || null,
-        transcribe_voice: !!data.transcribe_voice
+        transcribe_voice: !!data.transcribe_voice,
+        output_mode: data.output_mode === 'folder' ? 'folder' : 'zip',
+        folder_name: data.folder_name || null,
+        baseline: data.baseline && typeof data.baseline === 'object' ? data.baseline : null,
+        missing_files: Array.isArray(data.missing_files) ? data.missing_files : [],
+        reset_baseline: !!data.reset_baseline,
+        repair_usernames: Array.isArray(data.repair_usernames) ? data.repair_usernames : [],
+        recheck_media: !!data.recheck_media
       }
     })
   }
@@ -672,7 +738,12 @@ export const useApi = () => {
         format: data.format || 'html',
         use_cache: data.use_cache == null ? true : !!data.use_cache,
         output_dir: data.output_dir == null ? null : String(data.output_dir || '').trim(),
-        file_name: data.file_name || null
+        file_name: data.file_name || null,
+        output_mode: data.output_mode === 'folder' ? 'folder' : 'zip',
+        folder_name: data.folder_name || null,
+        baseline: data.baseline && typeof data.baseline === 'object' ? data.baseline : null,
+        missing_files: Array.isArray(data.missing_files) ? data.missing_files : [],
+        reset_baseline: !!data.reset_baseline
       }
     })
   }
@@ -826,6 +897,39 @@ export const useApi = () => {
     if (params && params.key_mode) query.set('key_mode', params.key_mode)
     const url = '/get_keys' + (query.toString() ? `?${query.toString()}` : '')
     return await request(url, params?.signal ? { signal: params.signal } : {})
+  }
+
+  const getMacosKeyCaptureStatus = async (params = {}) => {
+    return await request('/macos-key-capture/status', params?.signal ? { signal: params.signal } : {})
+  }
+
+  const macosKeyCaptureRequest = async (action, params = {}) => {
+    const options = {
+      method: 'POST',
+      body: {
+        wechat_install_path: params.wechat_install_path || null,
+        db_storage_path: params.db_storage_path || null,
+        timeout: params.timeout || 240
+      }
+    }
+    if (params.signal) options.signal = params.signal
+    return await request(`/macos-key-capture/${action}`, options)
+  }
+
+  const prepareMacosKeyCapture = async (params = {}) => {
+    return await macosKeyCaptureRequest('prepare', params)
+  }
+
+  const preflightMacosKeyCapture = async (params = {}) => {
+    return await macosKeyCaptureRequest('preflight', params)
+  }
+
+  const captureMacosKey = async (params = {}) => {
+    return await macosKeyCaptureRequest('capture', params)
+  }
+
+  const cancelMacosKeyCapture = async (params = {}) => {
+    return await macosKeyCaptureRequest('cancel', params)
   }
 
   // 获取图片密钥
@@ -1087,6 +1191,11 @@ export const useApi = () => {
     getWrappedAnnualMeta,
     getWrappedAnnualCard,
     getKeys,
+    getMacosKeyCaptureStatus,
+    prepareMacosKeyCapture,
+    preflightMacosKeyCapture,
+    captureMacosKey,
+    cancelMacosKeyCapture,
     getImageKey,
     getImageKeyMemory,
     getWxStatus,
