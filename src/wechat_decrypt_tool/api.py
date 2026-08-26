@@ -1,6 +1,8 @@
 ﻿"""微信解密工具的FastAPI Web服务器"""
 
+import mimetypes
 import os
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -20,6 +22,7 @@ request_logger = get_logger("wechat_decrypt_tool.request")
 from . import __version__ as APP_VERSION
 from .path_fix import PathFixRoute
 from .chat_realtime_autosync import CHAT_REALTIME_AUTOSYNC
+from .sns_realtime_autosync import SNS_REALTIME_AUTOSYNC
 from .routers.chat import router as _chat_router
 from .routers.chat_contacts import router as _chat_contacts_router
 from .routers.chat_export import router as _chat_export_router
@@ -29,6 +32,7 @@ from .routers.import_decrypted import router as _import_decrypted_router
 from .routers.health import router as _health_router
 from .routers.admin import router as _admin_router
 from .routers.account_archive_export import router as _account_archive_export_router
+from .routers.account_prepare import router as _account_prepare_router
 from .routers.keys import router as _keys_router
 from .routers.media import router as _media_router
 from .routers.mcp import router as _mcp_router
@@ -123,6 +127,7 @@ async def _record_content_free_product_events(request: Request, call_next):
 app.include_router(_health_router)
 app.include_router(_admin_router)
 app.include_router(_account_archive_export_router)
+app.include_router(_account_prepare_router)
 app.include_router(_wechat_detection_router)
 app.include_router(_import_decrypted_router)
 app.include_router(_decrypt_router)
@@ -143,8 +148,26 @@ app.include_router(_record_export_router)
 app.include_router(_system_router)
 
 
+# Python's MIME database inherits Windows registry overrides.  Keep the
+# generated frontend's static asset types deterministic across installations.
+for _media_type, _suffix in (
+    ("text/javascript", ".js"),
+    ("text/javascript", ".mjs"),
+    ("text/css", ".css"),
+    ("application/json", ".json"),
+    ("image/svg+xml", ".svg"),
+):
+    mimetypes.add_type(_media_type, _suffix)
+
+
 class _SPAStaticFiles(StaticFiles):
     """StaticFiles with a SPA fallback (Nuxt generate output)."""
+
+    _CONTENT_TYPE_OVERRIDES = {
+        ".js": "text/javascript; charset=utf-8",
+        ".mjs": "text/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+    }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -180,6 +203,9 @@ class _SPAStaticFiles(StaticFiles):
         normalized = self._normalize_path(path)
         try:
             response = await super().get_response(path, scope)
+            content_type = self._CONTENT_TYPE_OVERRIDES.get(Path(normalized).suffix.lower())
+            if content_type:
+                response.headers["content-type"] = content_type
             return self._apply_cache_headers(normalized, response)
         except StarletteHTTPException as exc:
             if exc.status_code != 404:
@@ -235,6 +261,30 @@ _maybe_mount_frontend()
 
 
 @app.on_event("startup")
+async def _startup_recover_macos_key_capture() -> None:
+    if sys.platform != "darwin":
+        return
+    from .macos_resign_key_capture import capture_journal_path, recover_official_wechat
+
+    if not capture_journal_path().exists():
+        return
+    try:
+        result = recover_official_wechat(cleanup=True)
+        logger.warning(
+            "Recovered official WeChat from an interrupted key-capture transaction: state=%s",
+            str(result.get("state") or "unknown"),
+        )
+    except Exception as exc:
+        logger.critical(
+            "Official WeChat recovery requires attention: error_code=%s",
+            str(getattr(exc, "code", "RECOVERY_FAILED")),
+        )
+        raise RuntimeError(
+            "Official WeChat recovery failed; run the emergency recovery command before starting WCDA."
+        ) from exc
+
+
+@app.on_event("startup")
 async def _startup_native_core() -> None:
     from .native_core_client import configure_native_core_entrypoint
 
@@ -245,6 +295,12 @@ async def _startup_native_core() -> None:
 @app.on_event("startup")
 async def _startup_background_jobs() -> None:
     try:
+        from .wechat_update_guard import start_update_guard_enforcer
+
+        start_update_guard_enforcer()
+    except Exception:
+        logger.exception("Failed to start WeChat update preference enforcer")
+    try:
         WCDB_REALTIME.start_background_prime()
     except Exception:
         logger.exception("Failed to start native-core account preparation")
@@ -252,12 +308,26 @@ async def _startup_background_jobs() -> None:
         CHAT_REALTIME_AUTOSYNC.start()
     except Exception:
         logger.exception("Failed to start realtime autosync service")
+    try:
+        SNS_REALTIME_AUTOSYNC.start()
+    except Exception:
+        logger.exception("Failed to start SNS realtime autosync service")
 
 
 @app.on_event("shutdown")
 async def _shutdown_wcdb_realtime() -> None:
     try:
+        from .wechat_update_guard import stop_update_guard_enforcer
+
+        stop_update_guard_enforcer()
+    except Exception:
+        pass
+    try:
         CHAT_REALTIME_AUTOSYNC.stop()
+    except Exception:
+        pass
+    try:
+        SNS_REALTIME_AUTOSYNC.stop()
     except Exception:
         pass
     try:

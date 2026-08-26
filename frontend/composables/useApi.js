@@ -25,6 +25,19 @@ export const useApi = () => {
     }
     return fallback
   }
+
+  const responseError = (response, message) => {
+    const error = new Error(message)
+    const detail = response?._data?.detail
+    error.status = Number(response?.status || 0)
+    error.statusCode = error.status
+    error.data = response?._data
+    error.detail = detail
+    if (detail && typeof detail === 'object' && detail.code) {
+      error.code = String(detail.code).trim()
+    }
+    return error
+  }
   
   // 基础请求函数
   const request = async (url, options = {}) => {
@@ -37,7 +50,7 @@ export const useApi = () => {
             const fallback = response.status === 400
               ? '请求参数错误'
               : `请求失败 (${response.status})`
-            throw new Error(responseDetailMessage(response, fallback))
+            throw responseError(response, responseDetailMessage(response, fallback))
           } else if (response.status >= 500) {
             const backendDetail = responseDetailMessage(response)
             const message = backendDetail || '服务器错误，请稍后重试'
@@ -50,7 +63,7 @@ export const useApi = () => {
               source: 'useApi',
               apiBase: baseURL,
             })
-            throw new Error(message)
+            throw responseError(response, message)
           }
         }
       })
@@ -89,6 +102,24 @@ export const useApi = () => {
     return await request('/decrypt', {
       method: 'POST',
       body: data
+    })
+  }
+
+  // Inspect/prepare one detected account without exposing its saved DB key to the page.
+  const getAccountPrepareState = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params.account) query.set('account', params.account)
+    if (params.db_storage_path) query.set('db_storage_path', params.db_storage_path)
+    return await request(`/account/prepare?${query.toString()}`)
+  }
+
+  const prepareAccount = async (data = {}) => {
+    return await request('/account/prepare', {
+      method: 'POST',
+      body: {
+        account: data.account || '',
+        db_storage_path: data.db_storage_path || ''
+      }
     })
   }
 
@@ -343,6 +374,22 @@ export const useApi = () => {
     return await request(url)
   }
 
+  const syncSnsRealtimeLatest = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params && params.account) query.set('account', params.account)
+    if (params && params.max_scan != null) query.set('max_scan', String(params.max_scan))
+    if (params && params.force != null) query.set('force', String(params.force))
+    const url = '/sns/realtime/sync_latest' + (query.toString() ? `?${query.toString()}` : '')
+    return await request(url, { method: 'POST' })
+  }
+
+  const getSnsSnapshotStatus = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params && params.account) query.set('account', params.account)
+    const url = '/sns/snapshot/status' + (query.toString() ? `?${query.toString()}` : '')
+    return await request(url)
+  }
+
   const openChatMediaFolder = async (params = {}) => {
     const query = new URLSearchParams()
     if (params && params.account) query.set('account', params.account)
@@ -400,6 +447,168 @@ export const useApi = () => {
     })
   }
 
+  const getVoiceTranscriptionStatus = async () => {
+    return await request('/chat/media/voice/transcription/status')
+  }
+
+  const setVoiceTranscriptionSettings = async (data = {}) => {
+    const body = {}
+    if (data.device != null) body.device = String(data.device || '').trim().toLowerCase()
+    if (data.model != null) body.model = String(data.model || '').trim()
+    return await request('/chat/media/voice/transcription/settings', {
+      method: 'PUT',
+      body
+    })
+  }
+
+  const setVoiceTranscriptionDevice = async (device) => {
+    return await setVoiceTranscriptionSettings({ device })
+  }
+
+  const setVoiceTranscriptionModel = async (model) => {
+    return await setVoiceTranscriptionSettings({ model })
+  }
+
+  const downloadVoiceTranscriptionModel = async (model) => {
+    const modelId = encodeURIComponent(String(model || '').trim())
+    return await request(`/chat/media/voice/transcription/models/${modelId}/download`, {
+      method: 'POST'
+    })
+  }
+
+  const getVoiceTranscriptionModelDownload = async (jobId) => {
+    const id = encodeURIComponent(String(jobId || '').trim())
+    return await request(`/chat/media/voice/transcription/models/downloads/${id}`)
+  }
+
+  const deleteVoiceTranscriptionModel = async (model) => {
+    const modelId = encodeURIComponent(String(model || '').trim())
+    return await request(`/chat/media/voice/transcription/models/${modelId}`, {
+      method: 'DELETE'
+    })
+  }
+
+  const transcribeChatVoice = async (data = {}) => {
+    return await request('/chat/media/voice/transcription', {
+      method: 'POST',
+      body: {
+        account: data.account || null,
+        // svr_id 是 19 位大整数，超出 JS Number 安全范围，必须以字符串原样传输，
+        // 避免精度丢失导致后端查不到语音数据（后端 pydantic 会将精确字符串解析为 int）。
+        server_id: String(data.server_id ?? '').trim(),
+        force: !!data.force
+      }
+    })
+  }
+
+  const getNativeVoiceTranscript = async (data = {}) => {
+    const query = new URLSearchParams()
+    if (data.account) query.set('account', String(data.account).trim())
+    query.set('server_id', String(data.server_id ?? '').trim())
+    if (data.username) query.set('username', String(data.username).trim())
+    const localId = String(data.local_id ?? '').trim()
+    const requestId = String(data.request_id ?? '').trim()
+    if (localId && localId !== '0') query.set('local_id', localId)
+    if (requestId) query.set('request_id', requestId)
+    return await request(
+      `/chat/media/voice/transcription/native?${query.toString()}`,
+      data.signal ? { signal: data.signal } : {}
+    )
+  }
+
+  const triggerNativeVoiceTranscription = async (data = {}) => {
+    const body = {
+      account: String(data.account ?? '').trim(),
+      username: String(data.username ?? '').trim()
+    }
+    const serverId = String(data.server_id ?? '').trim()
+    const localId = String(data.local_id ?? '').trim()
+    if (serverId && serverId !== '0') body.server_id = serverId
+    if (localId && localId !== '0') body.local_id = localId
+    return await request('/chat/media/voice/transcription/native/trigger', {
+      method: 'POST',
+      body
+    })
+  }
+
+  const getNativeVoiceTranscriptionStatus = async (data = {}) => {
+    const query = new URLSearchParams()
+    if (data.account) query.set('account', String(data.account).trim())
+    return await request(
+      `/chat/media/voice/transcription/native/status${query.toString() ? `?${query.toString()}` : ''}`
+    )
+  }
+
+  const lookupNativeVoiceTranscriptionCache = async (data = {}) => {
+    const items = Array.isArray(data.items)
+      ? data.items.map((item) => ({
+          server_id: String(item?.server_id ?? '').trim(),
+          local_id: String(item?.local_id ?? '').trim()
+        })).filter((item) => item.server_id && item.local_id)
+      : []
+    return await request('/chat/media/voice/transcription/native/cache_lookup', {
+      method: 'POST',
+      body: {
+        account: String(data.account ?? '').trim(),
+        username: String(data.username ?? '').trim(),
+        items
+      }
+    })
+  }
+
+  // 批量读取语音转写缓存（仅恢复展示，不触发识别；serverIdStr 精确字符串数组）
+  const lookupChatVoiceTranscriptionCache = async (data = {}) => {
+    return await request('/chat/media/voice/transcription/cache_lookup', {
+      method: 'POST',
+      body: {
+        account: data.account || null,
+        server_ids: Array.isArray(data.server_ids)
+          ? data.server_ids.map((v) => String(v ?? '').trim()).filter(Boolean)
+          : []
+      }
+    })
+  }
+
+  const deleteAllVoiceTranscriptionCache = async () => {
+    return await request('/chat/media/voice/transcription/cache/all', {
+      method: 'DELETE'
+    })
+  }
+
+  const startVoiceTranscriptionBatch = async (data = {}) => {
+    const requestedConcurrency = data.concurrency
+    const concurrency = requestedConcurrency === null || requestedConcurrency === undefined || requestedConcurrency === ''
+      ? 0
+      : requestedConcurrency
+    if (typeof concurrency !== 'number' || !Number.isInteger(concurrency) || concurrency < 0) {
+      throw new RangeError('并发线程数必须是非负整数（0 表示自动）')
+    }
+    return await request('/chat/media/voice/transcription/batch', {
+      method: 'POST',
+      body: {
+        account: data.account || null,
+        force: !!data.force,
+        concurrency
+      }
+    })
+  }
+
+  const getLatestVoiceTranscriptionBatch = async (account = '') => {
+    const query = new URLSearchParams()
+    if (account) query.set('account', String(account))
+    return await request(`/chat/media/voice/transcription/batch${query.toString() ? `?${query.toString()}` : ''}`)
+  }
+
+  const getVoiceTranscriptionBatch = async (jobId) => {
+    return await request(`/chat/media/voice/transcription/batch/${encodeURIComponent(String(jobId || '').trim())}`)
+  }
+
+  const cancelVoiceTranscriptionBatch = async (jobId) => {
+    return await request(`/chat/media/voice/transcription/batch/${encodeURIComponent(String(jobId || '').trim())}`, {
+      method: 'DELETE'
+    })
+  }
+
   // 聊天记录导出（离线zip）
   const createChatExport = async (data = {}) => {
     return await request('/chat/exports', {
@@ -422,7 +631,8 @@ export const useApi = () => {
         download_remote_media: !!data.download_remote_media,
         html_page_size: data.html_page_size != null ? Number(data.html_page_size) : 1000,
         privacy_mode: !!data.privacy_mode,
-        file_name: data.file_name || null
+        file_name: data.file_name || null,
+        transcribe_voice: !!data.transcribe_voice
       }
     })
   }
@@ -785,6 +995,17 @@ export const useApi = () => {
     })
   }
 
+  const getWechatUpdateGuardStatus = async () => {
+    return await request('/system/wechat_update_guard/status')
+  }
+
+  const toggleWechatUpdateGuard = async (enabled) => {
+    return await request('/system/wechat_update_guard/toggle', {
+      method: 'POST',
+      body: { enabled: !!enabled }
+    })
+  }
+
 
   return {
     pickSystemDirectory,
@@ -792,9 +1013,13 @@ export const useApi = () => {
     toggleImgHelper,
     getCdnImageStatus,
     toggleCdnImage,
+    getWechatUpdateGuardStatus,
+    toggleWechatUpdateGuard,
     detectWechat,
     detectCurrentAccount,
     decryptDatabase,
+    getAccountPrepareState,
+    prepareAccount,
     importDecryptedPreview,
     importDecrypted,
     healthCheck,
@@ -819,11 +1044,31 @@ export const useApi = () => {
     resolveAppMsg,
     listSnsTimeline,
     listSnsUsers,
+    syncSnsRealtimeLatest,
+    getSnsSnapshotStatus,
     openChatMediaFolder,
     downloadChatEmoji,
     saveMediaKeys,
     getSavedKeys,
     decryptAllMedia,
+    getVoiceTranscriptionStatus,
+    setVoiceTranscriptionSettings,
+    setVoiceTranscriptionDevice,
+    setVoiceTranscriptionModel,
+    downloadVoiceTranscriptionModel,
+    getVoiceTranscriptionModelDownload,
+    deleteVoiceTranscriptionModel,
+    transcribeChatVoice,
+    getNativeVoiceTranscript,
+    triggerNativeVoiceTranscription,
+    getNativeVoiceTranscriptionStatus,
+    lookupNativeVoiceTranscriptionCache,
+    lookupChatVoiceTranscriptionCache,
+    deleteAllVoiceTranscriptionCache,
+    startVoiceTranscriptionBatch,
+    getLatestVoiceTranscriptionBatch,
+    getVoiceTranscriptionBatch,
+    cancelVoiceTranscriptionBatch,
     createChatExport,
     getChatExport,
     listChatExports,

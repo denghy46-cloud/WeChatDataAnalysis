@@ -199,7 +199,7 @@
             <div class="flex flex-col gap-2 border-b border-[#DDEBE0] pb-3 sm:flex-row sm:items-end sm:justify-between">
               <div>
                 <h2 class="text-[22px] font-semibold tracking-[-0.03em] text-[#000000e6]">可操作的微信账号</h2>
-                <p class="mt-1 text-[13px] leading-6 text-[#7F7F7F]">点击解密提取，会将该账号信息带入下一步。</p>
+                <p class="mt-1 text-[13px] leading-6 text-[#7F7F7F]">确认账号后会自动复用已保存密钥；新账号只需完成一次本地捕获。</p>
               </div>
               <span class="rounded-md border border-[#CFEEDB] bg-[#F4FBF6]/86 px-2.5 py-1 text-[12px] font-medium text-[#07C160]">
                 {{ sortedAccounts.length }} 个账号
@@ -244,23 +244,43 @@
 
                       <div class="mt-1.5 flex flex-wrap items-center gap-2 text-[12px] text-[#7F7F7F]">
                         <span class="rounded-md border border-[#E1EFE5] bg-[#F4FAF6]/82 px-2 py-1">{{ account.database_count }} 个库文件</span>
-                        <span v-if="isCurrentAccount(account.account_name)" class="rounded-md border border-[#CFEEDB] bg-[#F4FBF6]/86 px-2 py-1 font-medium text-[#07C160]">最近登录</span>
+                        <span v-if="isCurrentAccount(account.account_name)" class="rounded-md border border-[#CFEEDB] bg-[#F4FBF6]/86 px-2 py-1 font-medium text-[#07C160]">{{ currentAccountSourceLabel }}</span>
                         <span v-if="account.data_dir" class="rounded-md border border-[#CFEEDB] bg-[#F4FBF6]/86 px-2 py-1 text-[#07C160]">路径已确认</span>
+                        <span v-if="accountState(account).key_saved" class="rounded-md border border-[#CFEEDB] bg-[#F4FBF6]/86 px-2 py-1 font-medium text-[#07C160]">密钥已保存</span>
+                        <span v-if="accountState(account).decrypted_ready" class="rounded-md border border-[#CFEEDB] bg-[#F4FBF6]/86 px-2 py-1 font-medium text-[#07C160]">本地副本已就绪</span>
+                        <span v-else-if="accountState(account).loading" class="rounded-md border border-[#E1EFE5] bg-[#F4FAF6]/82 px-2 py-1">正在检查状态</span>
                       </div>
                     </div>
                   </div>
 
-                  <button
-                    type="button"
-                    class="inline-flex shrink-0 items-center justify-center rounded-lg bg-[#07C160] px-3 py-2 text-sm font-medium text-white transition hover:bg-[#06AD56] focus:outline-none focus:ring-2 focus:ring-[#07C160]/25"
-                    @click="goToDecrypt(account)"
-                  >
-                    解密提取
-                    <svg class="ml-1.5 h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
-                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
-                    </svg>
-                  </button>
+                  <div class="flex shrink-0 flex-col gap-2 sm:items-end">
+                    <button
+                      type="button"
+                      :disabled="accountState(account).busy || accountState(account).loading"
+                      class="inline-flex min-w-[122px] items-center justify-center rounded-lg bg-[#07C160] px-3 py-2 text-sm font-medium text-white transition hover:bg-[#06AD56] focus:outline-none focus:ring-2 focus:ring-[#07C160]/25 disabled:cursor-wait disabled:opacity-60"
+                      @click="prepareDetectedAccount(account)"
+                    >
+                      <svg v-if="accountState(account).busy" class="mr-1.5 h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.5" class="opacity-20"></circle>
+                        <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"></path>
+                      </svg>
+                      {{ accountActionLabel(account) }}
+                      <svg v-if="!accountState(account).busy" class="ml-1.5 h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                      </svg>
+                    </button>
+                    <button
+                      v-if="accountState(account).export_ready"
+                      type="button"
+                      class="inline-flex min-w-[122px] items-center justify-center rounded-lg border border-[#CFEEDB] bg-[#F7FDF9] px-3 py-2 text-xs font-medium text-[#07C160] transition hover:bg-[#EFFAF3]"
+                      @click="openAccountExport(account)"
+                    >
+                      导出账号归档
+                    </button>
+                  </div>
                 </div>
+
+                <p v-if="accountState(account).error" class="mt-2 text-[12px] leading-5 text-[#D64A4A]">{{ accountState(account).error }}</p>
 
                 <div v-if="account.data_dir" class="mt-3 border-t border-dashed border-[#DDEBE0] pt-2.5">
                   <p class="truncate font-mono text-[12px] text-[#7F7F7F]" :title="account.data_dir">
@@ -295,6 +315,7 @@
       @primary="confirmGuide"
       @close="closeGuide"
     />
+    <GlobalExportDialog :open="exportDialogOpen" @close="exportDialogOpen = false" />
   </div>
 </template>
 
@@ -305,9 +326,17 @@ import {useApi} from '~/composables/useApi'
 import {withErrorLogGuidance} from '~/composables/useErrorNotice'
 import {normalizeWechatInstallPath, readStoredWechatInstallPath, writeStoredWechatInstallPath} from '~/lib/wechat-install-path'
 import {useAppStore} from '~/stores/app'
+import {useChatAccountsStore} from '~/stores/chatAccounts'
 
-const { detectWechat, pickSystemDirectory, getPlatformCapabilities } = useApi()
+const {
+  detectWechat,
+  pickSystemDirectory,
+  getPlatformCapabilities,
+  getAccountPrepareState,
+  prepareAccount,
+} = useApi()
 const appStore = useAppStore()
+const chatAccounts = useChatAccountsStore()
 const loading = ref(false)
 const detectionResult = ref(null)
 const customPath = ref('')
@@ -318,6 +347,8 @@ const isMacos = computed(() => platformCapabilities.value?.platform === 'macos')
 const STORAGE_KEY = 'wechat_data_root_path'
 const guideMode = ref('')
 const guideOpen = computed(() => !!guideMode.value)
+const accountStates = ref({})
+const exportDialogOpen = ref(false)
 
 const GUIDE_CONFIGS = {
   detection: {
@@ -476,7 +507,7 @@ const performPickWechatInstallDirectory = async () => {
 
 const pickWechatInstallDirectory = () => openGuide('installPath')
 
-// 计算属性：将当前登录账号排在第一位
+// 将检测到的账号排在第一位
 const sortedAccounts = computed(() => {
   if (!detectionResult.value?.data?.accounts) return []
   const accounts = [...detectionResult.value.data.accounts]
@@ -486,7 +517,7 @@ const sortedAccounts = computed(() => {
 
   if (!currentTargetName) return accounts
 
-  // 置顶最近登录账号
+  // 置顶检测到的账号
   return accounts.sort((a, b) => {
     if (a.account_name === currentTargetName) return -1
     if (b.account_name === currentTargetName) return 1
@@ -498,6 +529,123 @@ const sortedAccounts = computed(() => {
 const currentAccountInfo = computed(() => {
   return detectionResult.value?.data?.current_account || null
 })
+
+const currentAccountSourceLabel = computed(() => {
+  const labels = {
+    live_session: '当前登录',
+    key_info_mtime: '最近活动（推测）',
+    global_config: '已保存账号（推测）'
+  }
+  return labels[currentAccountInfo.value?.source] || '候选账号（推测）'
+})
+
+const accountDbStoragePath = (account) => {
+  const dataDir = String(account?.data_dir || '').replace(/[\\/]+$/, '')
+  if (!dataDir) return ''
+  return `${dataDir}${isMacos.value ? '/' : '\\'}db_storage`
+}
+
+const accountState = (account) => {
+  const name = String(account?.account_name || '').trim()
+  return accountStates.value[name] || {
+    loading: false,
+    busy: false,
+    key_saved: false,
+    decrypted_ready: false,
+    export_ready: false,
+    next_action: 'capture_key',
+    error: ''
+  }
+}
+
+const updateAccountState = (accountName, patch) => {
+  const name = String(accountName || '').trim()
+  if (!name) return
+  accountStates.value = {
+    ...accountStates.value,
+    [name]: { ...accountState({ account_name: name }), ...patch }
+  }
+}
+
+const refreshAccountState = async (account) => {
+  const name = String(account?.account_name || '').trim()
+  const dbStoragePath = accountDbStoragePath(account)
+  if (!name || !dbStoragePath) return
+  updateAccountState(name, { loading: true, error: '' })
+  try {
+    const state = await getAccountPrepareState({ account: name, db_storage_path: dbStoragePath })
+    updateAccountState(name, { ...state, loading: false })
+  } catch (e) {
+    updateAccountState(name, { loading: false, error: e?.message || '账号状态检查失败。' })
+  }
+}
+
+const refreshAccountStates = async (accounts) => {
+  await Promise.all((Array.isArray(accounts) ? accounts : []).map((account) => refreshAccountState(account)))
+}
+
+const accountActionLabel = (account) => {
+  const state = accountState(account)
+  if (state.loading) return '正在检查'
+  if (state.busy) return state.next_action === 'decrypt_saved_key' ? '自动解密中' : '正在准备'
+  if (state.decrypted_ready && state.key_saved) return '打开聊天'
+  if (state.key_saved) return '自动解密'
+  return '首次获取并解密'
+}
+
+const rememberSelectedAccount = (account, { autoPrepare = false } = {}) => {
+  const accountName = String(account?.account_name || '').trim()
+  chatAccounts.setSelectedAccount(accountName)
+  if (process.client && typeof window !== 'undefined') {
+    sessionStorage.setItem('selectedAccount', JSON.stringify({
+      account_name: accountName,
+      data_dir: account.data_dir,
+      database_count: account.database_count,
+      databases: account.databases,
+      auto_prepare: !!autoPrepare
+    }))
+  }
+}
+
+const continueToFirstCapture = async (account) => {
+  persistWechatInstallPath()
+  rememberSelectedAccount(account, { autoPrepare: true })
+  await navigateTo('/decrypt')
+}
+
+const prepareDetectedAccount = async (account) => {
+  const name = String(account?.account_name || '').trim()
+  const dbStoragePath = accountDbStoragePath(account)
+  if (!name || !dbStoragePath || accountState(account).busy || accountState(account).loading) return
+
+  const known = accountState(account)
+  if (!known.key_saved) {
+    await continueToFirstCapture(account)
+    return
+  }
+
+  updateAccountState(name, { busy: true, error: '' })
+  try {
+    const prepared = await prepareAccount({ account: name, db_storage_path: dbStoragePath })
+    updateAccountState(name, { ...prepared, busy: false, loading: false })
+    if (prepared?.status === 'needs_key_capture' || prepared?.next_action === 'capture_key') {
+      await continueToFirstCapture(account)
+      return
+    }
+    if (prepared?.decrypted_ready) {
+      rememberSelectedAccount(account)
+      sessionStorage.removeItem('selectedAccount')
+      await navigateTo('/chat')
+    }
+  } catch (e) {
+    updateAccountState(name, { busy: false, error: e?.message || '账号自动解密失败。' })
+  }
+}
+
+const openAccountExport = (account) => {
+  chatAccounts.setSelectedAccount(String(account?.account_name || '').trim())
+  exportDialogOpen.value = true
+}
 
 // 开始检测
 const startDetection = async () => {
@@ -558,6 +706,7 @@ const startDetection = async () => {
           }
         } catch {}
       }
+      await refreshAccountStates(result?.data?.accounts || [])
     }
   } catch (err) {
     console.error('检测过程中发生错误:', err)
@@ -570,22 +719,7 @@ const startDetection = async () => {
   }
 }
 
-// 跳转到解密页面并传递账户信息
-const goToDecrypt = (account) => {
-  persistWechatInstallPath()
-
-  if (process.client && typeof window !== 'undefined') {
-    sessionStorage.setItem('selectedAccount', JSON.stringify({
-      account_name: account.account_name,
-      data_dir: account.data_dir,
-      database_count: account.database_count,
-      databases: account.databases
-    }))
-  }
-  navigateTo('/decrypt')
-}
-
-// 判断是否为当前登录账号
+// 判断是否为检测到的账号
 const isCurrentAccount = (accountName) => {
   if (!detectionResult.value?.data?.current_account) {
     return false

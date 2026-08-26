@@ -18,6 +18,7 @@ try {
   autoUpdaterLoadError = err;
 }
 const { spawn, spawnSync } = require("child_process");
+const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
 const net = require("net");
@@ -479,6 +480,20 @@ function sanitizeAccountName(account) {
   return name;
 }
 
+function canonicalAccountKeyName(account) {
+  let name = String(account || "").trim();
+  const backupMatch = /^(.+)\.backup-\d{8}-\d{6}(?:-\d+)?$/i.exec(name);
+  if (backupMatch) name = backupMatch[1];
+  const sourceMatch = /^(wxid_[^_\s]+)_[0-9a-f]{4}$/i.exec(name);
+  return sourceMatch ? sourceMatch[1] : name;
+}
+
+function isInternalAccountDataDirectory(name) {
+  const value = String(name || "").trim();
+  if (!value || value.startsWith(".")) return true;
+  return /\.backup-\d{8}-\d{6}(?:-\d+)?$/i.test(value);
+}
+
 function listDecryptedAccountsOnDisk(databasesDir) {
   try {
     if (!fs.existsSync(databasesDir)) return [];
@@ -497,6 +512,7 @@ function listDecryptedAccountsOnDisk(databasesDir) {
   for (const entry of entries) {
     try {
       if (!entry || !entry.isDirectory()) continue;
+      if (isInternalAccountDataDirectory(entry.name)) continue;
       const accountDir = path.join(databasesDir, entry.name);
       const hasSession = fs.existsSync(path.join(accountDir, "session.db"));
       const hasContact = fs.existsSync(path.join(accountDir, "contact.db"));
@@ -514,9 +530,15 @@ function resolveAccountDirInOutput(account) {
   const outputDir = resolveOutputDir();
   if (!outputDir) throw new Error("无法定位 output 目录");
   const databasesDir = path.join(outputDir, "databases");
-  const accountName = sanitizeAccountName(account);
+  const requestedAccountName = sanitizeAccountName(account);
+  const canonicalAccountName = sanitizeAccountName(canonicalAccountKeyName(requestedAccountName));
 
   const base = path.resolve(databasesDir);
+  const canonicalDir = path.resolve(path.join(databasesDir, canonicalAccountName));
+  const accountName = (
+    canonicalAccountName !== requestedAccountName
+    && fs.existsSync(canonicalDir)
+  ) ? canonicalAccountName : requestedAccountName;
   const accountDir = path.resolve(path.join(databasesDir, accountName));
   if (accountDir !== base && !accountDir.startsWith(base + path.sep)) {
     throw new Error("账号路径非法");
@@ -529,6 +551,14 @@ function resolveAccountDirInOutput(account) {
     accountName,
     accountDir,
   };
+}
+
+function accountKeySourceRoot(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return "";
+  const direct = String(item.db_key_source_db_storage_path || "").trim();
+  const wxidDir = String(item.db_key_source_wxid_dir || "").trim();
+  const value = direct || (wxidDir ? path.join(wxidDir, "db_storage") : "");
+  return value ? path.resolve(value) : "";
 }
 
 function getAccountInfoFromDisk(account) {
@@ -562,15 +592,39 @@ function getAccountInfoFromDisk(account) {
   };
 }
 
-function removeAccountFromKeyStore(outputDir, accountName) {
+function removeAccountFamilyFromKeyStore(outputDir, accountName) {
   const keyStorePath = path.join(outputDir, "account_keys.json");
   try {
     if (!fs.existsSync(keyStorePath)) return false;
     const raw = fs.readFileSync(keyStorePath, { encoding: "utf8" });
     const parsed = JSON.parse(raw || "{}");
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
-    if (!Object.prototype.hasOwnProperty.call(parsed, accountName)) return false;
-    delete parsed[accountName];
+    const canonical = canonicalAccountKeyName(accountName);
+    const namesToRemove = [];
+    const sourceRoots = new Set();
+    for (const [name, item] of Object.entries(parsed)) {
+      const identities = new Set([canonicalAccountKeyName(name)]);
+      if (item && typeof item === "object" && !Array.isArray(item)) {
+        identities.add(canonicalAccountKeyName(item.image_key_derived_wxid));
+        for (const key of ["db_key_source_wxid_dir", "image_key_source_wxid_dir"]) {
+          const sourcePath = String(item[key] || "").trim();
+          if (sourcePath) identities.add(canonicalAccountKeyName(path.basename(sourcePath)));
+        }
+      }
+      if (!identities.has(canonical)) continue;
+      namesToRemove.push(name);
+      const sourceRoot = accountKeySourceRoot(item);
+      if (sourceRoot) sourceRoots.add(sourceRoot);
+    }
+    if (sourceRoots.size) {
+      for (const [name, item] of Object.entries(parsed)) {
+        if (namesToRemove.includes(name)) continue;
+        const sourceRoot = accountKeySourceRoot(item);
+        if (sourceRoot && sourceRoots.has(sourceRoot)) namesToRemove.push(name);
+      }
+    }
+    if (!namesToRemove.length) return false;
+    for (const name of namesToRemove) delete parsed[name];
     fs.writeFileSync(keyStorePath, JSON.stringify(parsed, null, 2), { encoding: "utf8" });
     return true;
   } catch {
@@ -597,6 +651,25 @@ async function deleteAccountDataFromDisk(account) {
     throw new Error("账号数据不存在");
   }
 
+  const canonicalCleanupName = canonicalAccountKeyName(accountName);
+  const cleanupAccountNames = new Set([accountName]);
+  const requestedAccountName = sanitizeAccountName(account);
+  if (canonicalAccountKeyName(requestedAccountName) === canonicalCleanupName) {
+    cleanupAccountNames.add(requestedAccountName);
+  }
+  const accountDirsToRemove = new Set([accountDir]);
+  try {
+    for (const entry of fs.readdirSync(databasesDir, { withFileTypes: true })) {
+      if (
+        (!entry?.isDirectory() && !entry?.isSymbolicLink())
+        || isInternalAccountDataDirectory(entry.name)
+        || canonicalAccountKeyName(entry.name) !== canonicalCleanupName
+      ) continue;
+      cleanupAccountNames.add(entry.name);
+      accountDirsToRemove.add(path.join(databasesDir, entry.name));
+    }
+  } catch {}
+
   const wasBackendRunning = !!backendProc;
   let restartError = null;
   let result = null;
@@ -609,13 +682,29 @@ async function deleteAccountDataFromDisk(account) {
   }
 
   try {
-    const exportsDir = path.join(outputDir, "exports", accountName);
+    for (const cleanupName of cleanupAccountNames) {
+      try {
+        fs.rmSync(path.join(outputDir, "exports", cleanupName), { recursive: true, force: true });
+      } catch {}
+      try {
+        fs.rmSync(path.join(outputDir, "account_backups", cleanupName), { recursive: true, force: true });
+      } catch {}
+    }
     try {
-      fs.rmSync(exportsDir, { recursive: true, force: true });
+      for (const entry of fs.readdirSync(databasesDir, { withFileTypes: true })) {
+        if (
+          (!entry?.isDirectory() && !entry?.isSymbolicLink())
+          || !isInternalAccountDataDirectory(entry.name)
+          || canonicalAccountKeyName(entry.name) !== canonicalCleanupName
+        ) continue;
+        fs.rmSync(path.join(databasesDir, entry.name), { recursive: true, force: true });
+      }
     } catch {}
 
-    fs.rmSync(accountDir, { recursive: true, force: true });
-    const removedKeyCache = removeAccountFromKeyStore(outputDir, accountName);
+    for (const familyAccountDir of accountDirsToRemove) {
+      fs.rmSync(familyAccountDir, { recursive: true, force: true });
+    }
+    const removedKeyCache = removeAccountFamilyFromKeyStore(outputDir, accountName);
     const removedNativeCoreCache = clearNativeCoreRawKeyCache();
     const accounts = listDecryptedAccountsOnDisk(databasesDir);
     result = {
@@ -2476,6 +2565,233 @@ async function loadWithRetry(win, url) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 年度总结出图 / 批量打包
+// ---------------------------------------------------------------------------
+
+// 文件名安全化：既挡路径穿越（/ \ ..），也挡 Windows 不允许的字符。
+function sanitizeCaptureName(value, fallback = "wrapped") {
+  const safe = String(value || "")
+    .replace(/[\\/:*?"<>|\x00-\x1f]/g, "_")
+    .replace(/^\.+/, "_")
+    .slice(0, 80);
+  return safe || fallback;
+}
+
+// 截取核心。走 CDP Page.captureScreenshot 而不是 webContents.capturePage：
+//  - capturePage 的输出像素 = CSS 尺寸 × 显示器缩放比，2K/4K/Retina 上各出各的尺寸，不可控；
+//  - CDP 的 clip.scale 是真·按目标倍率重新栅格化，文字/描边/backdrop-filter 的模糊半径
+//    全部按新倍率重画，能稳定出 1080×1920 这类平台规格。
+// 两者都走真实合成器，所以 WebGL / backdrop-filter / CSS 3D 全部保真 ——
+// 这正是不选任何 DOM 序列化截图库（html2canvas / html-to-image 一类）的原因：
+// 本 deck 同时用了 three.js、backdrop-filter、preserve-3d，没有一个序列化方案能同时抓全。
+// 单页导出（app:captureRegion）与批量导出（app:wrappedBatchCapture）共用这一份，
+// 两条路的出图规格必须完全一致，别再复制一份出来。
+async function captureRegionToPngBuffer(wc, options = {}) {
+  const width = Math.max(1, Math.round(Number(options?.width) || 0));
+  const height = Math.max(1, Math.round(Number(options?.height) || 0));
+  const x = Math.max(0, Math.round(Number(options?.x) || 0));
+  const y = Math.max(0, Math.round(Number(options?.y) || 0));
+  const scale = Math.min(6, Math.max(0.1, Number(options?.scale) || 1));
+  if (width < 2 || height < 2) throw new Error("截取区域无效");
+
+  let attached = false;
+  try {
+    let data = "";
+    try {
+      if (!wc.debugger.isAttached()) {
+        wc.debugger.attach("1.3");
+        attached = true;
+      }
+      const shot = await wc.debugger.sendCommand("Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: false,
+        clip: { x, y, width, height, scale },
+      });
+      data = shot?.data || "";
+    } catch (cdpErr) {
+      // CDP 不可用（调试器被占用等）时降级到 capturePage：尺寸随显示器缩放比，但至少能出图
+      logMain(`[main] captureRegion CDP failed, fallback to capturePage: ${cdpErr?.message || cdpErr}`);
+      const image = await wc.capturePage(
+        { x, y, width, height },
+        { stayHidden: true, stayAwake: true }
+      );
+      if (image.isEmpty()) throw new Error("截取到空图像");
+      data = image.toPNG().toString("base64");
+    }
+    if (!data) throw new Error("截图为空");
+
+    let buffer = Buffer.from(data, "base64");
+    const rawWidth = Math.round(width * scale);
+    const rawHeight = Math.round(height * scale);
+    let outWidth = rawWidth;
+    let outHeight = rawHeight;
+
+    // CDP 的 clip×scale×dpr 会各自取整，出图常差 1px（实测 1080x1919）。
+    // 平台规格是硬要求（小红书/朋友圈按比例裁），这里收口到精确目标尺寸。
+    const targetW = Math.round(Number(options?.outWidth) || 0);
+    const targetH = Math.round(Number(options?.outHeight) || 0);
+    if (targetW > 1 && targetH > 1) {
+      let img = nativeImage.createFromBuffer(buffer);
+      const cur = img.getSize();
+      if (cur.width !== targetW || cur.height !== targetH) {
+        img = img.resize({ width: targetW, height: targetH, quality: "best" });
+        buffer = img.toPNG();
+      }
+      outWidth = targetW;
+      outHeight = targetH;
+    }
+    return { buffer, width: outWidth, height: outHeight, rawWidth, rawHeight };
+  } finally {
+    if (attached) {
+      try {
+        wc.debugger.detach();
+      } catch {}
+    }
+  }
+}
+
+// --- 零依赖 ZIP（store 模式，压缩方法 0）--------------------------------------
+// PNG 内部已经是 deflate，再压一遍几乎不省体积，所以直接 store：
+// 少一个依赖（desktop/package.json 只想留 electron-updater / ffmpeg-static），
+// 产物依然是标准合法 zip。文件都是几 MB 级别，不需要 zip64。
+const ZIP_CRC32_TABLE = (() => {
+  const table = new Int32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let c = i;
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[i] = c;
+  }
+  return table;
+})();
+
+function zipCrc32(buf) {
+  let c = -1;
+  for (let i = 0; i < buf.length; i += 1) c = (c >>> 8) ^ ZIP_CRC32_TABLE[(c ^ buf[i]) & 0xff];
+  return (c ^ -1) >>> 0;
+}
+
+// zip 用的是 MS-DOS 时间格式：秒只有 5 位（2 秒精度），年份从 1980 起算。
+function toDosDateTime(date) {
+  const year = date.getFullYear();
+  const dosYear = Math.min(127, Math.max(0, year - 1980));
+  return {
+    time:
+      ((date.getHours() & 0x1f) << 11) |
+      ((date.getMinutes() & 0x3f) << 5) |
+      ((date.getSeconds() >> 1) & 0x1f),
+    date: ((dosYear & 0x7f) << 9) | (((date.getMonth() + 1) & 0x0f) << 5) | (date.getDate() & 0x1f),
+  };
+}
+
+// entries: [{ name, data: Buffer }]，name 按 UTF-8 写入并置通用标志位 bit 11，
+// 否则中文名在 Windows 自带解压里会按 CP936 解读成乱码。
+function buildStoreZipBuffer(entries, when = new Date()) {
+  const stamp = toDosDateTime(when);
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+
+  for (const entry of entries) {
+    const nameBuf = Buffer.from(String(entry?.name || ""), "utf8");
+    const data = Buffer.isBuffer(entry?.data) ? entry.data : Buffer.from(entry?.data || "");
+    if (!nameBuf.length) throw new Error("zip 条目缺少文件名");
+    const crc = zipCrc32(data);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0); // local file header signature
+    local.writeUInt16LE(20, 4); // version needed to extract (2.0)
+    local.writeUInt16LE(0x0800, 6); // general purpose flag: bit 11 = 文件名是 UTF-8
+    local.writeUInt16LE(0, 8); // compression method: 0 = stored
+    local.writeUInt16LE(stamp.time, 10);
+    local.writeUInt16LE(stamp.date, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18); // compressed size
+    local.writeUInt32LE(data.length, 22); // uncompressed size
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28); // extra field length
+    localParts.push(local, nameBuf, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0); // central directory header signature
+    // version made by 的高字节是「宿主系统」。这里必须是 3（Unix）不能是 0（MS-DOS）：
+    // Info-ZIP（macOS 自带 unzip）看到 MS-DOS 宿主就会拿 CP437 去翻译文件名，
+    // 哪怕 bit 11 已经声明是 UTF-8 也照翻，中文名当场变乱码、解压直接 Illegal byte sequence。
+    central.writeUInt16LE(0x0314, 4); // version made by: 3 = Unix, 0x14 = 2.0
+    central.writeUInt16LE(20, 6); // version needed to extract
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(stamp.time, 12);
+    central.writeUInt16LE(stamp.date, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt16LE(0, 30); // extra field length
+    central.writeUInt16LE(0, 32); // file comment length
+    central.writeUInt16LE(0, 34); // disk number start
+    central.writeUInt16LE(0, 36); // internal file attributes
+    // 宿主是 Unix，外部属性的高 16 位就是 st_mode：0o100644 普通文件
+    central.writeUInt32LE(0x81a40000, 38); // external file attributes
+    central.writeUInt32LE(offset, 42); // relative offset of local header
+    centralParts.push(central, nameBuf);
+
+    offset += local.length + nameBuf.length + data.length;
+    if (offset > 0xffffffff) throw new Error("压缩包超过 4GB，暂不支持");
+  }
+
+  const centralBuf = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); // end of central directory signature
+  eocd.writeUInt16LE(0, 4); // number of this disk
+  eocd.writeUInt16LE(0, 6); // disk where central directory starts
+  eocd.writeUInt16LE(entries.length, 8); // entries on this disk
+  eocd.writeUInt16LE(entries.length, 10); // total entries
+  eocd.writeUInt32LE(centralBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16); // offset of central directory
+  eocd.writeUInt16LE(0, 20); // comment length
+  return Buffer.concat([...localParts, centralBuf, eocd]);
+}
+
+// --- 批次登记簿 --------------------------------------------------------------
+// batchId → 临时目录。只认自己发出去的 id（Map 查不到就拒），
+// 所以渲染进程递什么字符串过来都碰不到 batch 目录以外的路径。
+const wrappedExportBatches = new Map();
+const WRAPPED_BATCH_MAX_LIVE = 4;
+const WRAPPED_BATCH_TTL_MS = 30 * 60 * 1000;
+
+function disposeWrappedBatch(batchId) {
+  const batch = wrappedExportBatches.get(batchId);
+  if (!batch) return false;
+  wrappedExportBatches.delete(batchId);
+  try {
+    fs.rmSync(batch.dir, { recursive: true, force: true });
+  } catch (err) {
+    logMain(`[main] wrappedBatch cleanup failed ${batch.dir}: ${err?.message || err}`);
+  }
+  return true;
+}
+
+function sweepStaleWrappedBatches() {
+  const now = Date.now();
+  for (const [batchId, batch] of [...wrappedExportBatches]) {
+    if (now - batch.createdAt > WRAPPED_BATCH_TTL_MS) {
+      logMain(`[main] wrappedBatch expired ${batchId}`);
+      disposeWrappedBatch(batchId);
+    }
+  }
+}
+
+function disposeAllWrappedBatches() {
+  for (const batchId of [...wrappedExportBatches.keys()]) disposeWrappedBatch(batchId);
+}
+
+function getWrappedBatch(rawId) {
+  const batchId = String(rawId || "");
+  if (!/^wb_[0-9a-z]+_[0-9a-f]{12}$/.test(batchId)) return null;
+  return wrappedExportBatches.get(batchId) || null;
+}
+
 function registerWindowIpc() {
   const getWin = (event) => BrowserWindow.fromWebContents(event.sender);
 
@@ -2766,6 +3082,140 @@ function registerWindowIpc() {
     }
   });
 
+  // 年度总结分享出图（单页）。截取与收口逻辑在 captureRegionToPngBuffer 里，
+  // 这里只负责落盘到 output/年度总结/ 并在访达里揭示。
+  ipcMain.handle("app:captureRegion", async (event, options = {}) => {
+    const wc = event?.sender;
+    if (!wc || wc.isDestroyed()) return { ok: false, error: "窗口不可用" };
+
+    const safeName = sanitizeCaptureName(options?.name, "wrapped");
+
+    try {
+      const outDir = path.join(resolveOutputDir({ ensureExists: true }) || app.getPath("pictures"), "年度总结");
+      fs.mkdirSync(outDir, { recursive: true });
+
+      const shot = await captureRegionToPngBuffer(wc, options);
+
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")
+        .replace("T", "_")
+        .slice(0, 19);
+      const file = path.join(outDir, `${safeName}_${stamp}.png`);
+      fs.writeFileSync(file, shot.buffer);
+      logMain(`[main] captureRegion saved ${file} (${shot.rawWidth}x${shot.rawHeight})`);
+      // 存完直接在访达/资源管理器里选中它——不然用户根本不知道图去哪了
+      try {
+        shell.showItemInFolder(file);
+      } catch (revealErr) {
+        logMain(`[main] captureRegion reveal failed: ${revealErr?.message || revealErr}`);
+      }
+      return { ok: true, path: file, width: shot.rawWidth, height: shot.rawHeight };
+    } catch (err) {
+      const message = err?.message || String(err);
+      logMain(`[main] captureRegion failed: ${message}`);
+      return { ok: false, error: message };
+    }
+  });
+
+  // 年度总结批量导出：begin 开一个临时目录 → 每页 capture 一张进去 → finish 打成 zip。
+  // 拆成三步而不是一次性导出，是因为「翻到第 N 页并等动画停稳」只有渲染进程知道；
+  // 主进程这边只提供攒图和打包的容器。
+  ipcMain.handle("app:wrappedBatchBegin", async (_event, options = {}) => {
+    try {
+      sweepStaleWrappedBatches();
+      if (wrappedExportBatches.size >= WRAPPED_BATCH_MAX_LIVE) {
+        return { ok: false, error: "已有导出任务在进行中，请稍后再试" };
+      }
+      const label = String(options?.label || "年度总结").slice(0, 120);
+      const dir = fs.mkdtempSync(path.join(app.getPath("temp"), "wechat-wrapped-"));
+      const batchId = `wb_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
+      wrappedExportBatches.set(batchId, { dir, label, createdAt: Date.now(), count: 0 });
+      logMain(`[main] wrappedBatchBegin ${batchId} label=${label} dir=${dir}`);
+      return { ok: true, batchId };
+    } catch (err) {
+      const message = err?.message || String(err);
+      logMain(`[main] wrappedBatchBegin failed: ${message}`);
+      return { ok: false, error: message };
+    }
+  });
+
+  // 与 app:captureRegion 同一套截取/收口逻辑，只是落到 batch 的临时目录、不揭示
+  ipcMain.handle("app:wrappedBatchCapture", async (event, options = {}) => {
+    const wc = event?.sender;
+    if (!wc || wc.isDestroyed()) return { ok: false, error: "窗口不可用" };
+    const batch = getWrappedBatch(options?.batchId);
+    if (!batch) return { ok: false, error: "导出任务不存在或已结束" };
+
+    try {
+      const shot = await captureRegionToPngBuffer(wc, options);
+      const index = Math.max(0, Math.min(999, Math.round(Number(options?.index) || 0)));
+      // index 是数字、name 过了安全化，拼出来的名字里不可能有分隔符，写不出 batch 目录
+      const fileName = `${String(index).padStart(2, "0")}_${sanitizeCaptureName(options?.name, "page")}.png`;
+      fs.writeFileSync(path.join(batch.dir, fileName), shot.buffer);
+      batch.count += 1;
+      logMain(`[main] wrappedBatchCapture ${batch.label} ${fileName} (${shot.width}x${shot.height})`);
+      return { ok: true, width: shot.width, height: shot.height };
+    } catch (err) {
+      const message = err?.message || String(err);
+      logMain(`[main] wrappedBatchCapture failed: ${message}`);
+      return { ok: false, error: message };
+    }
+  });
+
+  ipcMain.handle("app:wrappedBatchFinish", async (_event, options = {}) => {
+    const batchId = String(options?.batchId || "");
+    const batch = getWrappedBatch(batchId);
+    if (!batch) return { ok: false, error: "导出任务不存在或已结束" };
+
+    try {
+      // 按文件名排序就是按 index 排序（前面 padStart 过），解压出来即页面顺序
+      const names = fs
+        .readdirSync(batch.dir)
+        .filter((name) => name.toLowerCase().endsWith(".png"))
+        .sort();
+      if (!names.length) throw new Error("没有可打包的图片");
+
+      const entries = names.map((name) => ({
+        name,
+        data: fs.readFileSync(path.join(batch.dir, name)),
+      }));
+      const zipBuffer = buildStoreZipBuffer(entries);
+
+      const outDir = path.join(resolveOutputDir({ ensureExists: true }) || app.getPath("pictures"), "年度总结");
+      fs.mkdirSync(outDir, { recursive: true });
+      const zipBase = sanitizeCaptureName(options?.zipName, "年度总结");
+      let file = path.join(outDir, `${zipBase}.zip`);
+      // 同名不覆盖：用户连点两次不该把上一包吃掉
+      for (let seq = 2; fs.existsSync(file) && seq < 100; seq += 1) {
+        file = path.join(outDir, `${zipBase}_${seq}.zip`);
+      }
+      fs.writeFileSync(file, zipBuffer);
+      logMain(`[main] wrappedBatchFinish ${batchId} -> ${file} (${entries.length} images, ${zipBuffer.length} bytes)`);
+      try {
+        shell.showItemInFolder(file);
+      } catch (revealErr) {
+        logMain(`[main] wrappedBatchFinish reveal failed: ${revealErr?.message || revealErr}`);
+      }
+      return { ok: true, path: file, count: entries.length, bytes: zipBuffer.length };
+    } catch (err) {
+      const message = err?.message || String(err);
+      logMain(`[main] wrappedBatchFinish failed: ${message}`);
+      return { ok: false, error: message };
+    } finally {
+      // 成功失败都要把临时目录收掉，batchId 用完即废
+      disposeWrappedBatch(batchId);
+    }
+  });
+
+  ipcMain.handle("app:wrappedBatchAbort", async (_event, options = {}) => {
+    const batchId = String(options?.batchId || "");
+    // 校验只是为了不去 rm 一个来路不明的路径；找不到也回 ok，中断路径不该再抛错
+    const removed = getWrappedBatch(batchId) ? disposeWrappedBatch(batchId) : false;
+    logMain(`[main] wrappedBatchAbort ${batchId} removed=${removed}`);
+    return { ok: true };
+  });
+
   ipcMain.handle("app:openExternalUrl", async (_event, rawUrl) => {
     const url = String(rawUrl || "").trim();
     if (!url) throw new Error("外部链接为空");
@@ -3049,6 +3499,8 @@ app.on("will-quit", () => {
   try {
     globalShortcut.unregisterAll();
   } catch {}
+  // 导出到一半退出时，临时目录里可能还躺着几十 MB 的 PNG
+  disposeAllWrappedBatches();
 });
 
 app.on("before-quit", () => {

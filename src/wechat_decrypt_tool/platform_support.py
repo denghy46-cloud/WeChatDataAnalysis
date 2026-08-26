@@ -201,6 +201,10 @@ def runtime_capabilities() -> dict[str, Any]:
         "available": False,
         "note": MAC_DB_KEY_GUIDANCE,
     }
+    mac_resign_status: dict[str, Any] = {
+        "available": False,
+        "code": "UNSUPPORTED_PLATFORM",
+    }
     if system == "macos":
         try:
             from .macos_db_key_helper import inspect_macos_db_key_bundle
@@ -211,12 +215,26 @@ def runtime_capabilities() -> dict[str, Any]:
                 "available": False,
                 "note": "macOS 数据库密钥本地组件校验失败，请更新或重新安装正式版本。",
             }
+        try:
+            from .macos_resign_key_capture import inspect_resign_capture_capability
+
+            mac_resign_status = inspect_resign_capture_capability()
+        except Exception:
+            mac_resign_status = {
+                "available": False,
+                "code": "PREFLIGHT_FAILED",
+            }
     return {
         "platform": system,
         "platform_release": platform.release(),
         "architecture": architecture,
         "apple_silicon": apple_silicon,
-        "database_key_extraction": system == "windows" or bool(mac_db_key_status["available"]),
+        "database_key_extraction": system == "windows"
+        or bool(mac_db_key_status["available"])
+        or bool(mac_resign_status["available"]),
+        "database_key_private_helper": bool(mac_db_key_status["available"]),
+        "database_key_resign_capture": bool(mac_resign_status["available"]),
+        "database_key_resign_capture_code": str(mac_resign_status.get("code") or ""),
         "database_key_manual_input": True,
         "database_decryption": True,
         "image_key_memory_scan": system == "windows" or image_scan_ready,

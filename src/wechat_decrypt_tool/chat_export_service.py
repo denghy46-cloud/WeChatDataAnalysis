@@ -25,10 +25,13 @@ from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 
+from .account_identity import resolve_account_self_rowid, resolve_account_self_username
+from .account_source_policy import account_prefers_decrypted_snapshot
 from .chat_helpers import (
     _decode_message_content,
     _decode_sqlite_text,
     _extract_md5_from_packed_info,
+    _extract_voice_transcript_from_packed_info,
     _extract_sender_from_group_xml,
     _extract_xml_attr,
     _extract_xml_tag_or_attr,
@@ -56,7 +59,7 @@ from .chat_helpers import (
     _resolve_msg_table_name_by_map,
 )
 from .chat_realtime_autosync import CHAT_REALTIME_AUTOSYNC
-from .chat_realtime_reader import count_realtime_message_rows_via_exec, read_all_realtime_message_rows
+from .chat_realtime_reader import count_realtime_message_rows_via_exec, iter_realtime_message_rows
 from .logging_config import get_logger
 from .media_helpers import (
     MediaPathIndex,
@@ -93,6 +96,15 @@ from .wcdb_realtime import (
     get_messages as _wcdb_get_messages,
     get_sessions as _wcdb_get_sessions,
     open_message_cursor as _wcdb_open_message_cursor,
+    resolve_account_native_wxid as _wcdb_resolve_account_native_wxid,
+)
+from .voice_transcription import (
+    VoiceTranscriptionConfig,
+    VoiceTranscriptionError,
+    acquire_voice_model_activity,
+    capture_voice_transcript_cache_generation,
+    get_voice_transcription_service,
+    release_voice_model_activity,
 )
 
 logger = get_logger(__name__)
@@ -308,9 +320,31 @@ def _iter_chat_history_media_refs(record_item: str) -> list[tuple[str, str]]:
     return refs
 
 
+_VOICE_TRANSCRIPT_EXPORT_CSS = """
+/* Optional local voice transcription. Kept in public Python source so the
+   private wce_integrity source and its production signing key stay isolated. */
+.wechat-voice-wrapper { display: flex; flex-direction: column; width: 100%; position: relative; gap: 6px; }
+.wechat-voice-wrapper--received { align-items: flex-start; }
+.wechat-voice-wrapper--sent { align-items: flex-end; }
+.wechat-voice-transcript {
+  width: fit-content;
+  max-width: min(404px, 100%);
+  padding: 8px 12px;
+  border-radius: var(--message-radius);
+  font-size: 14px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.wechat-voice-transcript--received { background: #fff; color: #1a1a1a; }
+.wechat-voice-transcript--sent { background: #95EC69; color: #1a1a1a; }
+.wechat-voice-transcript--error { background: #fff; color: #b45309; }
+""".strip()
+
+
 def _load_ui_css_bundle(*, ui_public_dir: Optional[Path], report: dict[str, Any]) -> str:
     del ui_public_dir, report
-    return _native_export_css("chat")
+    return f'{_native_export_css("chat").rstrip()}\n{_VOICE_TRANSCRIPT_EXPORT_CSS}\n'
 
 
 @functools.lru_cache(maxsize=1)
@@ -929,6 +963,7 @@ class ExportJob:
     progress: ExportProgress = field(default_factory=ExportProgress)
     cancel_requested: bool = False
     content_key: Optional[bytearray] = field(default=None, repr=False)
+    voice_cache_generation: Optional[int] = field(default=None, repr=False)
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -1029,6 +1064,7 @@ class ChatExportManager:
         file_name: Optional[str],
         encrypt: bool = False,
         content_key: bytearray | None = None,
+        transcribe_voice: bool = False,
     ) -> ExportJob:
         if bool(encrypt) != (content_key is not None):
             raise ValueError("encrypted chat export requires one validated content key")
@@ -1037,7 +1073,9 @@ class ChatExportManager:
         source_norm = source_requested
         fallback_reason = ""
         retry_after_seconds = 0
-        if source_requested in {"auto", "realtime"}:
+        if source_requested == "auto" and account_prefers_decrypted_snapshot(account_dir):
+            source_norm = "decrypted"
+        elif source_requested in {"auto", "realtime"}:
             try:
                 WCDB_REALTIME.ensure_connected(account_dir)
                 source_norm = "realtime"
@@ -1059,6 +1097,11 @@ class ChatExportManager:
         )
         export_id = uuid.uuid4().hex[:12]
 
+        voice_cache_generation = (
+            capture_voice_transcript_cache_generation()
+            if bool(transcribe_voice) and not bool(privacy_mode)
+            else None
+        )
         job = ExportJob(
             export_id=export_id,
             account=account_dir.name,
@@ -1083,9 +1126,22 @@ class ChatExportManager:
                 "privacyMode": bool(privacy_mode),
                 "fileName": str(file_name or "").strip(),
                 "encrypted": bool(encrypt),
+                "transcribeVoice": bool(transcribe_voice),
             },
             content_key=content_key,
+            voice_cache_generation=voice_cache_generation,
         )
+
+        voice_activity_key = ""
+        if bool(transcribe_voice) and not bool(privacy_mode):
+            service = get_voice_transcription_service()
+            model = str(
+                getattr(getattr(service, "config", None), "model", "")
+                or VoiceTranscriptionConfig.from_env().model
+            )
+            voice_activity_key = acquire_voice_model_activity(
+                model
+            )
 
         with self._lock:
             self._jobs[export_id] = job
@@ -1104,10 +1160,21 @@ class ChatExportManager:
         t = threading.Thread(
             target=self._run_job_safe,
             args=(job, account_dir),
+            kwargs={"voice_activity_key": voice_activity_key},
             name=f"chat-export-{export_id}",
             daemon=True,
         )
-        t.start()
+        try:
+            t.start()
+        except Exception:
+            release_voice_model_activity(voice_activity_key)
+            erase_export_content_key(job.content_key)
+            job.content_key = None
+            with self._lock:
+                job.status = "error"
+                job.error = "导出任务启动失败。"
+                job.finished_at = time.time()
+            raise
         return job
 
     def _run_job_safe(
@@ -1116,9 +1183,23 @@ class ChatExportManager:
         account_dir: Path,
         *,
         report_outcome: bool = True,
+        voice_activity_key: Optional[str] = None,
     ) -> None:
         outcome: str | None = None
         try:
+            if voice_activity_key is None and bool((job.options or {}).get("transcribeVoice")) and not bool(
+                (job.options or {}).get("privacyMode")
+            ):
+                service = get_voice_transcription_service()
+                model = str(
+                    getattr(getattr(service, "config", None), "model", "")
+                    or VoiceTranscriptionConfig.from_env().model
+                )
+                voice_activity_key = acquire_voice_model_activity(
+                    model
+                )
+            if bool((job.options or {}).get("transcribeVoice")) and job.voice_cache_generation is None:
+                job.voice_cache_generation = capture_voice_transcript_cache_generation()
             self._run_job(job, account_dir)
             if job.status == "done":
                 outcome = "export_completed"
@@ -1130,6 +1211,7 @@ class ChatExportManager:
                 job.finished_at = time.time()
             outcome = "export_failed"
         finally:
+            release_voice_model_activity(voice_activity_key or "")
             erase_export_content_key(job.content_key)
             job.content_key = None
             if report_outcome and outcome is not None:
@@ -1178,6 +1260,7 @@ class ChatExportManager:
                 "privacyMode": False,
                 "fileName": str(file_name or "").strip(),
                 "encrypted": bool(encrypt),
+                "transcribeVoice": False,
                 "_archiveTitle": str(title or "").strip() or "聊天记录",
                 "_preparedConversations": prepared,
             },
@@ -1227,7 +1310,11 @@ class ChatExportManager:
         }
         has_prepared_conversations = bool(prepared_by_username)
         source_requested = _normalize_chat_source(opts.get("source"), default="auto")
-        source_norm = "realtime" if source_requested in {"auto", "realtime"} else "decrypted"
+        source_norm = (
+            "decrypted"
+            if source_requested == "auto" and account_prefers_decrypted_snapshot(account_dir)
+            else ("realtime" if source_requested in {"auto", "realtime"} else "decrypted")
+        )
         rt_conn = None
         if source_norm == "realtime" and not has_prepared_conversations:
             try:
@@ -1240,6 +1327,7 @@ class ChatExportManager:
                 )
             except WCDBRealtimeError as e:
                 raise RuntimeError(f"Realtime export requires WCDB/direct mode but connection failed: {e}") from e
+        self_username = _wcdb_resolve_account_native_wxid(account_dir, rt_conn)
 
         realtime_pause_reason = f"chat_export:{job.export_id}"
         realtime_paused = False
@@ -1276,6 +1364,8 @@ class ChatExportManager:
         allow_process_key_extract = bool(opts.get("allowProcessKeyExtract"))
         download_remote_media = bool(opts.get("downloadRemoteMedia"))
         privacy_mode = bool(opts.get("privacyMode"))
+        transcribe_voice = bool(opts.get("transcribeVoice")) and not privacy_mode
+        job.options["_transcribeVoiceActive"] = transcribe_voice
         try:
             html_page_size = int(opts.get("htmlPageSize") or 1000)
         except Exception:
@@ -1326,6 +1416,7 @@ class ChatExportManager:
             htmlPageSize=html_page_size,
             downloadRemoteMedia=download_remote_media,
             privacyMode=privacy_mode,
+            transcribeVoice=transcribe_voice,
         )
         _raise_if_job_cancelled(job, "options_resolved", trace)
 
@@ -1628,7 +1719,7 @@ class ChatExportManager:
                         self_avatar_path = _materialize_avatar(
                             zf=zf,
                             head_image_conn=head_image_conn,
-                            username=account_dir.name,
+                            username=self_username,
                             avatar_written=avatar_written,
                         )
 
@@ -2150,6 +2241,7 @@ class ChatExportManager:
                         "downloadRemoteMedia": bool(download_remote_media),
                         "htmlPageSize": int(html_page_size) if export_format == "html" else None,
                         "privacyMode": privacy_mode,
+                        "transcribeVoice": transcribe_voice,
                         "sourceRequested": source_requested,
                     },
                     "stats": {
@@ -2292,13 +2384,14 @@ def _resolve_export_targets(
     if source == "realtime":
         if rt_conn is None:
             rt_conn = WCDB_REALTIME.ensure_connected(account_dir)
+        self_aliases = {account_dir.name, _wcdb_resolve_account_native_wxid(account_dir, rt_conn)}
         with rt_conn.lock:
             raw_sessions = _wcdb_get_sessions(rt_conn.handle)
         rows = _normalize_realtime_session_rows(raw_sessions)
 
         def should_include_rt(item: dict[str, Any]) -> bool:
             u = str(item.get("username") or "").strip()
-            if not u or u == account_dir.name:
+            if not u or u in self_aliases:
                 return False
             if not include_hidden and int(item.get("is_hidden") or 0) == 1:
                 return False
@@ -2322,13 +2415,14 @@ def _resolve_export_targets(
 
     session_rows, session_hidden_by_username = _load_export_session_targets(account_dir)
     contact_usernames = _load_export_contact_usernames(account_dir)
+    self_aliases = {account_dir.name, _wcdb_resolve_account_native_wxid(account_dir)}
     discovered_message_targets = _load_message_backed_export_targets(
         account_dir=account_dir,
         seed_usernames=contact_usernames,
     )
 
     def should_include(u: str) -> bool:
-        if not u or u == account_dir.name:
+        if not u or u in self_aliases:
             return False
         if not include_hidden and int(session_hidden_by_username.get(u) or 0) == 1:
             return False
@@ -2543,6 +2637,7 @@ def _message_table_latest_timestamp(conn: sqlite3.Connection, table_name: str) -
 
 def _load_message_backed_export_targets(*, account_dir: Path, seed_usernames: set[str]) -> dict[str, int]:
     out: dict[str, int] = {}
+    self_aliases = {account_dir.name, _wcdb_resolve_account_native_wxid(account_dir)}
     for db_path in _iter_message_db_paths(account_dir):
         conn: Optional[sqlite3.Connection] = None
         try:
@@ -2558,7 +2653,7 @@ def _load_message_backed_export_targets(*, account_dir: Path, seed_usernames: se
             candidates.update(_load_name2id_usernames(conn))
             for username in candidates:
                 u = str(username or "").strip()
-                if not u or u == account_dir.name:
+                if not u or u in self_aliases:
                     continue
                 table_name = _resolve_msg_table_name_by_map(lower_to_actual, u)
                 if not table_name:
@@ -2593,7 +2688,9 @@ def build_chat_export_targets_preview(
     source_norm = source_requested
     fallback_reason = ""
     retry_after_seconds = 0
-    if source_requested in {"auto", "realtime"}:
+    if source_requested == "auto" and account_prefers_decrypted_snapshot(account_dir):
+        source_norm = "decrypted"
+    elif source_requested in {"auto", "realtime"}:
         source_norm = "realtime"
         if rt_conn is None:
             try:
@@ -2719,7 +2816,29 @@ def _conversation_dir_name(
     return f"{idx:04d}_{base}_{user_part}_{h}"
 
 
-def _normalize_realtime_message_item_for_export(item: dict[str, Any], *, account_dir: Path, conv_username: str) -> _Row:
+def _normalize_realtime_message_item_for_export(
+    item: dict[str, Any],
+    *,
+    account_dir: Path,
+    conv_username: str,
+    self_username: str = "",
+) -> _Row:
+    resolved_self_username = str(
+        self_username
+        or _wcdb_resolve_account_native_wxid(account_dir)
+        or resolve_account_self_username(account_dir)
+        or account_dir.name
+        or ""
+    ).strip()
+    self_aliases = {
+        value.lower()
+        for value in (
+            account_dir.name,
+            resolve_account_self_username(account_dir),
+            resolved_self_username,
+        )
+        if value
+    }
     message_content = _pick_case_insensitive_value(item, "message_content", "messageContent", "MessageContent")
     compress_content = _pick_case_insensitive_value(item, "compress_content", "compressContent", "CompressContent")
     raw_text = _decode_message_content(compress_content, message_content).strip()
@@ -2736,14 +2855,14 @@ def _normalize_realtime_message_item_for_export(item: dict[str, Any], *, account
             is_sent = bool(sent_value)
     if not is_sent:
         try:
-            if sender_username and sender_username.lower() == account_dir.name.lower():
+            if sender_username and sender_username.lower() in self_aliases:
                 is_sent = True
         except Exception:
             pass
 
     is_group = bool(str(conv_username or "").endswith("@chatroom"))
     if is_sent:
-        sender_username = account_dir.name
+        sender_username = resolved_self_username
     elif (not is_group) and (not sender_username):
         sender_username = conv_username
 
@@ -2775,9 +2894,16 @@ def _iter_realtime_rows_for_conversation(
     start_time: Optional[int],
     end_time: Optional[int],
     local_types: Optional[set[int]] = None,
+    checkpoint: Optional[Callable[[], None]] = None,
 ) -> Iterable[_Row]:
     db_storage_dir = _resolve_account_db_storage_dir(account_dir)
-    result = read_all_realtime_message_rows(
+    logger.info(
+        "[chat-export] realtime message stream started account=%s conversation=%s page_size=%s",
+        account_dir.name,
+        conv_username,
+        1000,
+    )
+    source_rows = iter_realtime_message_rows(
         rt_conn=rt_conn,
         account_dir=account_dir,
         username=conv_username,
@@ -2791,26 +2917,30 @@ def _iter_realtime_rows_for_conversation(
         start_time=start_time,
         end_time=end_time,
         local_types=local_types,
+        page_size=1000,
+        checkpoint=checkpoint,
     )
+    yielded = 0
+    self_username = _wcdb_resolve_account_native_wxid(account_dir, rt_conn)
+    for item in source_rows:
+        if not isinstance(item, dict):
+            continue
+        row = _normalize_realtime_message_item_for_export(
+            item,
+            account_dir=account_dir,
+            conv_username=conv_username,
+            self_username=self_username,
+        )
+        if row.local_id <= 0:
+            continue
+        yielded += 1
+        yield row
     logger.info(
-        "[chat-export] realtime messages loaded account=%s conversation=%s strategy=%s rows=%s "
-        "tables=%s databases=%s authoritative=%s diagnostics=%s",
+        "[chat-export] realtime message stream completed account=%s conversation=%s rows=%s",
         account_dir.name,
         conv_username,
-        result.strategy,
-        len(result.rows),
-        result.tables_found,
-        result.databases_probed,
-        result.authoritative,
-        list(result.diagnostics),
+        yielded,
     )
-    rows = [
-        _normalize_realtime_message_item_for_export(item, account_dir=account_dir, conv_username=conv_username)
-        for item in result.rows
-        if isinstance(item, dict)
-    ]
-    rows = [row for row in rows if row.local_id > 0]
-    return rows
 
 
 def _estimate_conversation_message_count(
@@ -2908,6 +3038,7 @@ def _iter_rows_for_conversation(
     local_types: Optional[set[int]] = None,
     source: str = "decrypted",
     rt_conn: Any | None = None,
+    checkpoint: Optional[Callable[[], None]] = None,
 ) -> Iterable[_Row]:
     if source == "realtime":
         if rt_conn is None:
@@ -2919,13 +3050,14 @@ def _iter_rows_for_conversation(
             start_time=start_time,
             end_time=end_time,
             local_types=local_types,
+            checkpoint=checkpoint,
         )
 
     db_paths = _iter_message_db_paths(account_dir)
     if not db_paths:
         return []
 
-    account_wxid = account_dir.name
+    account_wxid = resolve_account_self_username(account_dir)
 
     def iter_db(db_path: Path) -> Iterable[_Row]:
         conn = sqlite3.connect(str(db_path))
@@ -2939,16 +3071,21 @@ def _iter_rows_for_conversation(
             # compress_content reliably (and avoid losing binary payloads).
             conn.text_factory = bytes
 
-            my_rowid = None
-            try:
-                r = conn.execute(
-                    "SELECT rowid FROM Name2Id WHERE user_name = ? LIMIT 1",
-                    (account_wxid,),
-                ).fetchone()
-                if r is not None:
-                    my_rowid = int(r[0])
-            except Exception:
-                my_rowid = None
+            my_rowid, _matched_self_username = resolve_account_self_rowid(
+                conn,
+                account_dir,
+            )
+            if my_rowid is None:
+                native_self_username = _wcdb_resolve_account_native_wxid(account_dir)
+                if native_self_username:
+                    native_rowid, native_match = resolve_account_self_rowid(
+                        conn,
+                        account_dir,
+                        candidates=(native_self_username,),
+                    )
+                    if native_rowid is not None:
+                        my_rowid, _matched_self_username = native_rowid, native_match
+            resolved_account_wxid = _matched_self_username or account_wxid
 
             quoted = _quote_ident(table_name)
             has_packed_info_data = False
@@ -3031,7 +3168,7 @@ def _iter_rows_for_conversation(
                     is_group = bool(conv_username.endswith("@chatroom"))
 
                     if is_sent:
-                        sender_username = account_wxid
+                        sender_username = resolved_account_wxid
                     elif (not is_group) and (not sender_username):
                         sender_username = conv_username
 
@@ -3086,6 +3223,11 @@ def _parse_message_for_export(
             sender_username = xml_sender
 
     local_type = int(row.local_type or 0)
+    native_voice_transcript = (
+        _extract_voice_transcript_from_packed_info(row.packed_info_data)
+        if local_type == 34
+        else ""
+    )
     is_sent = bool(row.is_sent)
 
     render_type = "text"
@@ -3490,6 +3632,11 @@ def _parse_message_for_export(
         "videoUrl": video_url,
         "videoThumbUrl": video_thumb_url,
         "voiceLength": voice_length,
+        "voiceTranscript": native_voice_transcript,
+        "voiceTranscriptStatus": "success" if native_voice_transcript else "idle",
+        "voiceTranscriptError": "",
+        "voiceTranscriptLanguage": "",
+        "voiceTranscriptModel": "wechat-native" if native_voice_transcript else "",
         "quoteUsername": quote_username,
         "quoteServerId": quote_server_id,
         "quoteType": quote_type,
@@ -3653,6 +3800,12 @@ def _write_conversation_json(
                 local_types=local_types,
                 source=source,
                 rt_conn=rt_conn,
+                checkpoint=lambda: _raise_if_job_cancelled(
+                    job,
+                    "json.realtime_fetch",
+                    trace,
+                    conversation=conv_username,
+                ),
             )
             for source_message in source_messages:
                 scanned += 1
@@ -3766,6 +3919,13 @@ def _write_conversation_json(
                         serverId=msg.get("serverId"),
                     )
 
+                _attach_voice_transcript(
+                    account_dir=account_dir,
+                    msg=msg,
+                    report=report,
+                    job=job,
+                )
+
                 if not first:
                     tw.write(",\n")
                 tw.write("    " + json.dumps(msg, ensure_ascii=False))
@@ -3827,13 +3987,17 @@ def _write_conversation_excel(**kwargs: Any) -> int:
         rows: list[list[str]] = []
         for index, message_raw in enumerate(messages if isinstance(messages, list) else [], start=1):
             message = message_raw if isinstance(message_raw, dict) else {"value": message_raw}
-            content = str(
-                message.get("content")
-                or message.get("title")
-                or message.get("description")
-                or message.get("fileName")
-                or ""
-            ).strip()
+            if str(message.get("renderType") or "") == "voice" and message.get("voiceTranscriptStatus") == "success":
+                transcript = str(message.get("voiceTranscript") or "").strip() or "[未识别到文字]"
+                content = f"{message.get('content') or '[语音]'} 转写：{transcript}"
+            else:
+                content = str(
+                    message.get("content")
+                    or message.get("title")
+                    or message.get("description")
+                    or message.get("fileName")
+                    or ""
+                ).strip()
             if not content:
                 content = json.dumps(message, ensure_ascii=False, default=str, sort_keys=True)
             rows.append(
@@ -3999,6 +4163,12 @@ def _write_conversation_txt(
                 local_types=local_types,
                 source=source,
                 rt_conn=rt_conn,
+                checkpoint=lambda: _raise_if_job_cancelled(
+                    job,
+                    "txt.realtime_fetch",
+                    trace,
+                    conversation=conv_username,
+                ),
             )
             for source_message in source_messages:
                 scanned += 1
@@ -4110,6 +4280,13 @@ def _write_conversation_txt(
                         localId=msg.get("localId"),
                         serverId=msg.get("serverId"),
                     )
+
+                _attach_voice_transcript(
+                    account_dir=account_dir,
+                    msg=msg,
+                    report=report,
+                    job=job,
+                )
 
                 tw.write(_format_message_line_txt(msg=msg) + "\n")
 
@@ -4896,6 +5073,12 @@ def _write_conversation_html(
                 local_types=local_types,
                 source=source,
                 rt_conn=rt_conn,
+                checkpoint=lambda: _raise_if_job_cancelled(
+                    job,
+                    "html.realtime_fetch",
+                    trace,
+                    conversation=conv_username,
+                ),
             )
             for source_message in source_messages:
                 scanned += 1
@@ -4995,6 +5178,13 @@ def _write_conversation_html(
                         localId=msg.get("localId"),
                         serverId=msg.get("serverId"),
                     )
+
+                _attach_voice_transcript(
+                    account_dir=account_dir,
+                    msg=msg,
+                    report=report,
+                    job=job,
+                )
 
                 rt = str(msg.get("renderType") or "text").strip() or "text"
                 create_time_text = str(msg.get("createTimeText") or "").strip()
@@ -5138,9 +5328,11 @@ def _write_conversation_html(
                     voice_dir_cls = "wechat-voice-sent" if is_sent else "wechat-voice-received"
                     content_dir_cls = " flex-row-reverse" if is_sent else ""
                     icon_dir_cls = "voice-icon-sent" if is_sent else "voice-icon-received"
+                    wrapper_dir_cls = "wechat-voice-wrapper--sent" if is_sent else "wechat-voice-wrapper--received"
+                    transcript_dir_cls = "wechat-voice-transcript--sent" if is_sent else "wechat-voice-transcript--received"
                     voice_id = str(msg.get("id") or "").strip()
 
-                    tw.write('                  <div class="wechat-voice-wrapper">\n')
+                    tw.write(f'                  <div class="wechat-voice-wrapper {esc_attr(wrapper_dir_cls)}">\n')
                     tw.write(
                         f'                    <div class="wechat-voice-bubble msg-radius {esc_attr(voice_dir_cls)}" style="width: {esc_attr(width)}" data-voice-id="{esc_attr(voice_id)}">\n'
                     )
@@ -5163,6 +5355,22 @@ def _write_conversation_html(
                     tw.write("                    </div>\n")
                     if voice:
                         tw.write(f'                    <audio src="{esc_attr(voice)}" preload="none" class="hidden"></audio>\n')
+                    transcript = str(msg.get("voiceTranscript") or "").strip()
+                    transcript_status = str(msg.get("voiceTranscriptStatus") or "").strip()
+                    transcript_error = str(msg.get("voiceTranscriptError") or "").strip()
+                    if transcript_status == "success":
+                        display_transcript = transcript or "未识别到文字"
+                        tw.write(
+                            '                    <div class="wechat-voice-transcript wechat-voice-transcript--success '
+                            f'{esc_attr(transcript_dir_cls)}">'
+                            f'{esc_text(display_transcript)}</div>\n'
+                        )
+                    elif transcript_status == "error" and transcript_error:
+                        tw.write(
+                            '                    <div class="wechat-voice-transcript wechat-voice-transcript--error '
+                            f'{esc_attr(transcript_dir_cls)}">'
+                            f'转写失败：{esc_text(transcript_error)}</div>\n'
+                        )
                     tw.write("                  </div>\n")
                 elif rt == "location":
                     title = str(
@@ -5844,6 +6052,15 @@ def _format_message_line_txt(*, msg: dict[str, Any]) -> str:
         if lat and lng:
             details.append(f"坐标={lng},{lat}")
         extra = (" " + " ".join(details)) if details else ""
+    elif rt == "voice":
+        transcript = str(msg.get("voiceTranscript") or "").strip()
+        transcript_error = str(msg.get("voiceTranscriptError") or "").strip()
+        if transcript:
+            extra = f" 转写={transcript}"
+        elif str(msg.get("voiceTranscriptStatus") or "") == "success":
+            extra = " 转写=[未识别到文字]"
+        elif transcript_error:
+            extra = f" 转写失败={transcript_error}"
 
     media = msg.get("offlineMedia") or []
     media_desc = ""
@@ -5955,11 +6172,73 @@ def _privacy_scrub_message(
         "locationLng",
         "locationPoiname",
         "locationLabel",
+        "voiceTranscript",
+        "voiceTranscriptStatus",
+        "voiceTranscriptError",
+        "voiceTranscriptLanguage",
+        "voiceTranscriptModel",
     ):
         if k in msg:
             msg[k] = ""
 
     msg.pop("offlineMedia", None)
+
+
+def _attach_voice_transcript(
+    *,
+    account_dir: Path,
+    msg: dict[str, Any],
+    report: dict[str, Any],
+    job: ExportJob,
+) -> None:
+    if not bool((job.options or {}).get("_transcribeVoiceActive")):
+        return
+    if str(msg.get("renderType") or "").strip() != "voice":
+        return
+
+    native_transcript = str(msg.get("voiceTranscript") or "").strip()
+    if msg.get("voiceTranscriptStatus") == "success" and native_transcript:
+        stats = report.setdefault(
+            "voiceTranscription",
+            {"success": 0, "failed": 0, "cached": 0, "native": 0},
+        )
+        stats["success"] = int(stats.get("success") or 0) + 1
+        stats["native"] = int(stats.get("native") or 0) + 1
+        return
+
+    server_id = int(msg.get("serverId") or 0)
+    if server_id <= 0:
+        return
+    _raise_if_job_cancelled(job, "voice_transcription.start", serverId=server_id)
+
+    stats = report.setdefault(
+        "voiceTranscription",
+        {"success": 0, "failed": 0, "cached": 0},
+    )
+    try:
+        result = get_voice_transcription_service().transcribe_voice(
+            account_dir=account_dir,
+            server_id=server_id,
+            cache_generation=job.voice_cache_generation,
+        )
+        msg["voiceTranscript"] = str(result.get("text") or "").strip()
+        msg["voiceTranscriptStatus"] = "success"
+        msg["voiceTranscriptError"] = ""
+        msg["voiceTranscriptLanguage"] = str(result.get("language") or "").strip()
+        msg["voiceTranscriptModel"] = str(result.get("model") or "").strip()
+        stats["success"] = int(stats.get("success") or 0) + 1
+        if result.get("cached"):
+            stats["cached"] = int(stats.get("cached") or 0) + 1
+    except VoiceTranscriptionError as exc:
+        msg["voiceTranscript"] = ""
+        msg["voiceTranscriptStatus"] = "error"
+        msg["voiceTranscriptError"] = exc.user_message
+        stats["failed"] = int(stats.get("failed") or 0) + 1
+    except Exception as exc:
+        msg["voiceTranscript"] = ""
+        msg["voiceTranscriptStatus"] = "error"
+        msg["voiceTranscriptError"] = f"语音识别失败：{type(exc).__name__}"
+        stats["failed"] = int(stats.get("failed") or 0) + 1
 
 
 def _attach_offline_media(

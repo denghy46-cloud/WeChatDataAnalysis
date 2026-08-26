@@ -220,6 +220,57 @@ class TestSnsMedia(unittest.TestCase):
         asyncio.run(run())
         self.assertEqual(calls, 1)
 
+    def test_remote_image_failure_log_has_status_and_redacts_credentials(self):
+        raw_url_token = "url-token-must-not-leak"
+        request_token = "request-token-must-not-leak"
+        request_key = "request-key-must-not-leak"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, request=request)
+
+        async def run(account_dir: Path):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                return await sns_media.try_fetch_and_decrypt_sns_image_remote(
+                    account_dir=account_dir,
+                    url=(
+                        "https://mmsns.qpic.cn/sns/diagnostic/0"
+                        f"?token={raw_url_token}&idx=9&foo=bar"
+                    ),
+                    key=request_key,
+                    token=request_token,
+                    use_cache=False,
+                    client=client,
+                    diagnostic_id="diag-http-400",
+                )
+
+        with TemporaryDirectory() as td:
+            account_dir = Path(td) / "acc"
+            account_dir.mkdir(parents=True, exist_ok=True)
+            with mock.patch.object(sns_media.logger, "info") as log_info:
+                result = asyncio.run(run(account_dir))
+
+        rendered: list[str] = []
+        for item in log_info.call_args_list:
+            args = item.args
+            if not args:
+                continue
+            try:
+                rendered.append(str(args[0]) % tuple(args[1:]))
+            except Exception:
+                rendered.append(" ".join(str(value) for value in args))
+        logs = "\n".join(rendered)
+
+        self.assertIsNone(result)
+        self.assertIn("remote:download-error", logs)
+        self.assertIn('"diagnosticId": "diag-http-400"', logs)
+        self.assertIn('"errorType": "HTTPStatusError"', logs)
+        self.assertIn('"statusCode": 400', logs)
+        self.assertIn('"urlHost": "mmsns.qpic.cn"', logs)
+        self.assertIn('"urlIdentity":', logs)
+        self.assertNotIn(raw_url_token, logs)
+        self.assertNotIn(request_token, logs)
+        self.assertNotIn(request_key, logs)
+
     def test_prefetch_sns_remote_media_skips_exact_remote_cache_hits(self):
         image_task = sns_export_service.SnsRemoteMediaTask(
             kind="image",
@@ -758,6 +809,38 @@ class TestSnsMedia(unittest.TestCase):
         u2 = "https://mmsns.qpic.cn/sns/abc/150?foo=bar"
         out2 = sns_media.fix_sns_cdn_url(u2, token="tkn", is_video=False)
         self.assertEqual(out2, "https://mmsns.qpic.cn/sns/abc/0?foo=bar&token=tkn&idx=1")
+
+    def test_remote_image_falls_back_to_token_bound_thumbnail_path(self):
+        calls: list[str] = []
+        jpeg = b"\xff\xd8\xff\x00thumbnail"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            if request.url.path.endswith("/0"):
+                return httpx.Response(400, request=request)
+            if request.url.path.endswith("/150"):
+                return httpx.Response(200, content=jpeg, request=request)
+            return httpx.Response(404, request=request)
+
+        async def run(account_dir: Path):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                return await sns_media.try_fetch_and_decrypt_sns_image_remote(
+                    account_dir=account_dir,
+                    url="https://mmsns.qpic.cn/sns/token-bound/150",
+                    key="",
+                    token="thumbnail-token",
+                    use_cache=False,
+                    client=client,
+                )
+
+        with TemporaryDirectory() as td:
+            result = asyncio.run(run(Path(td)))
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.payload, jpeg)
+        self.assertEqual(result.media_type, "image/jpeg")
+        self.assertEqual(calls, ["/sns/token-bound/0", "/sns/token-bound/150"])
 
     def test_fix_sns_cdn_url_replaces_stale_token_and_idx(self):
         out = sns_media.fix_sns_cdn_url(
