@@ -176,6 +176,24 @@ cd desktop
 npm run dev
 ```
 
+在 macOS 上也可以从项目根目录使用本地管理菜单：
+
+```bash
+./wcda-menu.sh
+```
+
+菜单提供手动启动、停止、查看实时日志、重启和退出。也可以直接使用命令参数：
+
+```bash
+./wcda-menu.sh start
+./wcda-menu.sh stop
+./wcda-menu.sh logs
+./wcda-menu.sh restart
+./wcda-menu.sh status
+```
+
+运行日志保存在项目根目录的 `.wcda-runtime/wcda-dev.log`。同一台机器上不要同时从多个项目副本启动 WCDA，避免端口和应用数据目录冲突。
+
 #### 启动后端API服务
 ```bash
 # 在项目根目录
