@@ -58,3 +58,21 @@ git push origin main
 代码同步不会切换另一个 worktree 中正在运行的实例；首次运行新版之前，按 README 同步依赖。
 只有新版上游在目标机器、目标微信 build 上通过真实捕获和官方应用恢复验收后，
 才考虑删除个人备用流程；旧版本仍可从保留分支和 Git 历史恢复。
+
+## 桌面入口与源码启动检查（2026-09-27）
+
+桌面 `WCDA 管理菜单.command` 已由旧的 `WeChatDataAnalysis-macos-key-capture`
+改为调用主目录 `WeChatDataAnalysis/wcda-menu.sh`，并转发命令参数。
+五项管理菜单及 `desktop/scripts/dev.cjs` 入口仍兼容，因此未改菜单实现。
+菜单语法、`status` 和交互退出已验证；后端依赖已按锁文件同步到 2.7.0。
+
+**源码启动仍被上游运行包过期阻塞，不能将构建与回归通过理解为完整应用可启动。**
+上游 `desktop/resources/native-core-source-macos.json` 仍指向
+`macos-source-runtime-20260809-71122b5b-8e355001`，其到期时间为
+`2026-09-22T06:48:28Z`。直接调用上游 `ensureSourceNativeCore` 已复现
+“当前 WCDA 固定的 macOS 源码运行时已过期，请先拉取最新代码后再启动”。
+查询上游公开发布记录后未发现比 8 月 9 日更新的 Mac 源码运行包。
+需要上游发布有效运行包并更新固定引用；仅再次拉取当前相同提交不能解决。
+
+上游另有 9 月 25 日发布的 2.7.0 Apple Silicon 安装包，但安装包与源码运行包
+是独立交付渠道。本次未安装、替换或验证该安装包，也未修改原生组件的有效期校验。
