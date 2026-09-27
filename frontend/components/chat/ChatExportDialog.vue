@@ -206,32 +206,15 @@
                 <span>{{ opt.label }}</span>
               </label>
             </div>
-
-            <label
-              class="chat-export-transcription-option"
-              :class="{
-                'chat-export-transcription-option--selected': exportTranscribeVoice && !privacyMode && exportMessageTypes.includes('voice'),
-                'chat-export-transcription-option--disabled': privacyMode || !exportMessageTypes.includes('voice')
-              }"
-            >
-              <input
-                v-model="exportTranscribeVoice"
-                type="checkbox"
-                class="sr-only"
-                :disabled="privacyMode || !exportMessageTypes.includes('voice')"
-              />
-              <span class="chat-export-checkbox" :class="{ 'chat-export-checkbox--checked': exportTranscribeVoice && !privacyMode && exportMessageTypes.includes('voice') }" aria-hidden="true">
-                <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="m4 10 4 4 8-8" />
-                </svg>
-              </span>
-              <span class="chat-export-transcription-option__icon" aria-hidden="true">
-                <i class="fa-solid fa-language"></i>
-              </span>
-              <span class="chat-export-transcription-option__copy">
-                <strong>语音转文字</strong>
-                <small>本地 Whisper</small>
-              </span>
+            <label v-if="exportFormat === 'html'" class="chat-export-type-option chat-export-transcription-option">
+              <input v-model="exportDownloadRemoteMedia" type="checkbox" :disabled="privacyMode" />
+              <span>下载远程缩略图（需联网；关闭可显著加快导出）</span>
+            </label>
+            <label class="chat-export-type-option chat-export-transcription-option"
+              :class="{ 'chat-export-type-option--selected': exportTranscribeVoice && !privacyMode && exportMessageTypes.includes('voice') }">
+              <input v-model="exportTranscribeVoice" type="checkbox"
+                :disabled="privacyMode || !exportMessageTypes.includes('voice')" />
+              <span>导出时将语音转为文字（使用设置中选择的本地模型）</span>
             </label>
           </section>
 
@@ -711,6 +694,17 @@ export default defineComponent({
 </script>
 
 <style scoped>
+.chat-export-transcription-option {
+  margin-top: 12px;
+}
+.chat-export-transcription-option:has(input:disabled) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.chat-export-transcription-option input {
+  accent-color: var(--app-accent);
+}
+
 .chat-export-backdrop {
   position: fixed;
   inset: 0;
@@ -1647,47 +1641,6 @@ export default defineComponent({
   background: var(--export-accent-soft);
   color: var(--export-accent-text);
 }
-
-.chat-export-transcription-option {
-  display: grid;
-  grid-template-columns: 18px 24px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-  margin-top: 10px;
-  padding: 9px 10px;
-  border: 1px solid var(--app-border);
-  border-radius: 6px;
-  background: var(--app-surface-bg);
-  color: var(--app-text-secondary);
-  cursor: pointer;
-}
-
-.chat-export-transcription-option--selected {
-  border-color: var(--export-accent-border);
-  background: var(--export-accent-soft);
-}
-
-.chat-export-transcription-option--disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
-.chat-export-transcription-option__icon {
-  display: grid;
-  width: 24px;
-  height: 24px;
-  place-items: center;
-  color: var(--export-accent-text);
-}
-
-.chat-export-transcription-option__copy {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.chat-export-transcription-option__copy strong { color: var(--app-text-primary); font-size: 12px; }
-.chat-export-transcription-option__copy small { color: var(--app-text-muted); font-size: 11px; line-height: 1.4; }
 
 .chat-export-output-section {
   padding: 8px 0;

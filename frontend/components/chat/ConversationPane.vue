@@ -1,13 +1,51 @@
 <template>
   <div class="conversation-pane flex-1 flex flex-col min-h-0 min-w-0">
     <div v-if="selectedContact" class="flex-1 flex flex-col min-h-0 min-w-0 relative">
-      <div class="chat-header">
-        <div class="flex items-center gap-3">
-          <h2 class="chat-header-title text-base font-medium" :class="{ 'privacy-blur': privacyMode }">
-            {{ selectedContact ? selectedContact.name : '' }}
+      <div class="chat-header" :class="{ 'chat-header-ai': aiSidebarOpen }">
+        <div class="flex min-w-0 items-center gap-3">
+          <h2 class="chat-header-title flex min-w-0 items-center gap-1.5 text-base font-medium">
+            <span class="min-w-0 truncate" :class="{ 'privacy-blur': privacyMode }">{{ selectedContact.name }}</span>
+            <span
+              v-if="selectedContact.enterpriseName"
+              class="min-w-0 max-w-[16rem] truncate text-[14px] text-[#ff8000]"
+              :class="{ 'privacy-blur': privacyMode }"
+            >@{{ selectedContact.enterpriseName }}</span>
+            <img
+              v-if="selectedContact.isEnterpriseGroup"
+              src="/assets/images/wechat/wecom.png"
+              alt="企业微信群"
+              title="企业微信群"
+              class="h-4 w-4 shrink-0"
+            >
           </h2>
+          <button
+            v-if="groupAnnouncement"
+            type="button"
+            class="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-[#07C160] hover:bg-[#07C160]/10"
+            aria-haspopup="dialog"
+            title="查看群公告"
+            @click="openGroupAnnouncement"
+          >
+            <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 13V7l12-3v12L4 13Z" />
+              <path d="M8 13v6h3l1-5M19 8v4" />
+            </svg>
+            <span>群公告</span>
+          </button>
         </div>
-        <div class="ml-auto flex items-center gap-2">
+        <div class="ml-auto flex shrink-0 items-center gap-2">
+          <button type="button" class="header-btn-icon" :class="{ 'header-btn-icon-active': aiSidebarOpen }" aria-label="AI 助手" title="AI 助手" :aria-pressed="aiSidebarOpen" @click="toggleAiSidebar">AI</button>
+          <button
+            type="button"
+            class="header-btn-icon"
+            title="添加消息"
+            aria-label="添加消息"
+            @click="openFeatureUnavailableDialog"
+          >
+            <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+          </button>
           <button
             type="button"
             class="header-btn-icon"
@@ -79,6 +117,23 @@
               {{ opt.label }}
             </option>
           </select>
+          <button
+            v-if="selectedContact.isGroup"
+            type="button"
+            class="header-btn-icon"
+            :class="{ 'header-btn-icon-active': groupMembersSidebarOpen }"
+            :title="groupMembersSidebarOpen ? '关闭群成员' : '更多（群成员）'"
+            :aria-label="groupMembersSidebarOpen ? '关闭群成员' : '更多（群成员）'"
+            :aria-expanded="groupMembersSidebarOpen"
+            aria-controls="group-members-sidebar"
+            @click="toggleGroupMembersSidebar"
+          >
+            <svg class="h-5 w-5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+              <circle cx="5" cy="12" r="1.8" />
+              <circle cx="12" cy="12" r="1.8" />
+              <circle cx="19" cy="12" r="1.8" />
+            </svg>
+          </button>
         </div>
       </div>
 
@@ -98,10 +153,21 @@
 
       <MessageList :state="state" />
 
+      <form class="chat-composer" @submit.prevent="openFeatureUnavailableDialog">
+        <textarea
+          class="chat-composer-input"
+          rows="2"
+          aria-label="输入要发送的微信消息"
+        />
+        <div class="chat-composer-toolbar">
+          <button type="submit" class="chat-composer-send">发送</button>
+        </div>
+      </form>
+
       <button
         v-if="showJumpToBottom"
         type="button"
-        class="jump-to-bottom-btn absolute bottom-6 right-6 z-20 w-10 h-10 rounded-full border shadow flex items-center justify-center"
+        class="jump-to-bottom-btn absolute bottom-32 right-6 z-20 w-10 h-10 rounded-full border shadow flex items-center justify-center"
         title="回到最新"
         @click="scrollToBottom"
       >
@@ -122,8 +188,25 @@
         <p class="conversation-empty-text text-sm">
           从左侧列表选择联系人查看聊天记录
         </p>
+        <button v-if="selectedAccount" type="button" class="mt-5 rounded-lg border px-4 py-2 text-sm" :aria-pressed="aiSidebarOpen" @click="toggleAiSidebar">向全部聊天提问</button>
       </div>
     </div>
+
+    <GuideDialog
+      :open="groupAnnouncementOpen"
+      eyebrow=""
+      title="群公告"
+      description=""
+      primary-label="关闭"
+      tone="info"
+      @primary="closeGroupAnnouncement"
+      @close="closeGroupAnnouncement"
+    >
+      <p
+        class="whitespace-pre-wrap break-words text-sm leading-7 text-[#3f4a44]"
+        :class="{ 'privacy-blur': privacyMode }"
+      >{{ groupAnnouncement }}</p>
+    </GuideDialog>
   </div>
 </template>
 
@@ -144,3 +227,12 @@ export default defineComponent({
   }
 })
 </script>
+
+<style scoped>
+/* 侧栏打开后给工具栏单独一行，保留聊天内容空间，避免会话名被挤成竖排。 */
+@media (min-width: 1001px) and (max-width: 1440px) {
+  .chat-header-ai { height: auto; min-height: 56px; flex-shrink: 0; flex-wrap: wrap; gap: 4px; padding-top: 8px; padding-bottom: 8px; }
+  .chat-header-ai > div:first-child { width: 100%; }
+  .chat-header-ai > div:last-child { margin-left: 0; flex-wrap: wrap; }
+}
+</style>

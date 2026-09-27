@@ -26,7 +26,6 @@
             <button
               type="button"
               class="calendar-nav-btn"
-              :disabled="timeSidebarLoading"
               title="上个月"
               @click="prevTimeSidebarMonth"
             >
@@ -38,7 +37,6 @@
               <select
                 v-model.number="timeSidebarYear"
                 class="calendar-ym-select"
-                :disabled="timeSidebarLoading"
                 title="选择年份"
                 @change="onTimeSidebarYearMonthChange"
               >
@@ -49,7 +47,6 @@
               <select
                 v-model.number="timeSidebarMonth"
                 class="calendar-ym-select"
-                :disabled="timeSidebarLoading"
                 title="选择月份"
                 @change="onTimeSidebarYearMonthChange"
               >
@@ -61,7 +58,6 @@
             <button
               type="button"
               class="calendar-nav-btn"
-              :disabled="timeSidebarLoading"
               title="下个月"
               @click="nextTimeSidebarMonth"
             >
@@ -71,10 +67,14 @@
             </button>
           </div>
 
-          <ErrorNotice v-if="timeSidebarError" :message="timeSidebarError" compact class="time-sidebar-status time-sidebar-status-error" />
+          <div v-if="timeSidebarError" class="time-sidebar-status time-sidebar-status-error" role="status">
+            <ErrorNotice :message="timeSidebarError" compact />
+            <button type="button" class="mt-2 rounded border border-current px-2 py-1" @click="retryTimeSidebarMonth">重试</button>
+          </div>
           <div v-else class="time-sidebar-status">
             <span v-if="timeSidebarLoading">加载中...</span>
-            <span v-else>本月 {{ timeSidebarTotal }} 条消息，{{ timeSidebarActiveDays }} 天有聊天</span>
+            <span v-else-if="timeSidebarReady">本月 {{ timeSidebarTotal }} 条消息，{{ timeSidebarActiveDays }} 天有聊天</span>
+            <span v-else>尚未完成统计</span>
           </div>
 
           <div class="calendar-weekdays">
@@ -138,6 +138,12 @@
 
           <!-- 搜索输入区域（整合所有筛选条件） -->
           <div class="search-sidebar-input-section">
+            <div class="search-session-type-row" role="group" aria-label="搜索方式">
+              <button type="button" class="search-session-type-btn" :class="{'search-session-type-btn-active':messageSearchMode==='keyword'}" @click="changeSearchMode('keyword')">关键词</button>
+              <button type="button" class="search-session-type-btn" :class="{'search-session-type-btn-active':messageSearchMode==='hybrid'}" @click="changeSearchMode('hybrid')">智能搜索</button>
+              <button type="button" class="search-session-type-btn" @click="openLocalSearchSettings">本地检索设置</button>
+            </div>
+            <p v-if="messageSearchCoverage" class="px-1 py-2 text-[11px] text-[var(--app-text-secondary)]" role="status">{{ messageSearchCoverage }}</p>
             <!-- 第一行：范围 + 输入框 + 搜索按钮 -->
             <div class="search-input-combined" :class="{ 'search-input-combined-focused': searchInputFocused }">
               <!-- 左侧：范围切换 -->
@@ -400,7 +406,7 @@
                     <span v-if="messageSearchIndexProgressText" class="sidebar-status-detail">（{{ messageSearchIndexProgressText }}）</span>
                   </template>
                   <template v-else>
-                    找到 <strong>{{ messageSearchTotal }}</strong> 条结果
+                    {{ messageSearchMode === 'hybrid' ? '召回' : '找到' }} <strong>{{ messageSearchTotal }}</strong> {{ messageSearchMode === 'hybrid' ? '条相关候选' : '条结果' }}
                   </template>
                 </div>
                 <button
@@ -462,7 +468,9 @@
                     <div v-else class="sidebar-result-sender">
                       {{ hit.isSent ? '我' : '' }}
                     </div>
-                    <div class="sidebar-result-content" v-html="highlightKeyword(hit.snippet || hit.content || hit.title || '', messageSearchQuery)"></div>
+                    <div v-if="hit.matchMethods?.includes('semantic')" class="sidebar-result-content">{{ hit.snippet || hit.content || hit.title || '' }}</div>
+                    <div v-else class="sidebar-result-content" v-html="highlightKeyword(hit.snippet || hit.content || hit.title || '', messageSearchQuery)"></div>
+                    <span v-if="hit.matchMethods" class="text-[10px] text-[var(--app-accent)]">{{ hit.matchMethods.includes('semantic') ? (hit.matchMethods.includes('keyword') ? '关键词＋语义匹配' : '语义相关（按意思找到）') : '关键词匹配' }}</span>
                   </div>
                 </div>
               </div>
@@ -1004,12 +1012,16 @@
 
     <GuideDialog
       :open="modifyTextUnavailableDialogOpen"
-      eyebrow=""
-      title="操作失败"
+      export-style
+      eyebrow="功能暂未开放"
+      :title="developerContactTitle"
+      badge="暂时不可用"
       :description="modifyTextUnavailableMessage"
-      primary-label="关闭"
+      :primary-label="developerContactLabel"
+      secondary-label="关闭"
       tone="warning"
-      @primary="closeModifyTextUnavailableDialog"
+      @primary="contactDeveloper"
+      @secondary="closeModifyTextUnavailableDialog"
       @close="closeModifyTextUnavailableDialog"
     />
 
@@ -1022,6 +1034,7 @@ import { computed, defineComponent, ref, watch } from 'vue'
 import ChatExportDialog from '~/components/chat/ChatExportDialog.vue'
 import ChatHistoryFloatingWindows from '~/components/chat/ChatHistoryFloatingWindows.vue'
 import GuideDialog from '~/components/GuideDialog.vue'
+import { DEVELOPER_CONTACT_LABEL, DEVELOPER_CONTACT_TITLE } from '~/lib/developer-support'
 
 const PREVIEW_IMAGE_MIN_SCALE = 0.2
 const PREVIEW_IMAGE_MAX_SCALE = 8
@@ -1138,6 +1151,8 @@ export default defineComponent({
 
     return {
       ...props.state,
+      developerContactTitle: DEVELOPER_CONTACT_TITLE,
+      developerContactLabel: DEVELOPER_CONTACT_LABEL,
       previewImageScale,
       previewImageRotation,
       previewImageTransformStyle,

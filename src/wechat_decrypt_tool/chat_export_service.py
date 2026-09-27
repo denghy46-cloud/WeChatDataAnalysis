@@ -1218,6 +1218,23 @@ def _zip_arcname(value: Any) -> str:
     return s
 
 
+def _replace_ordered_export_index_item(
+    index: dict[str, dict[str, Any]],
+    item: dict[str, Any],
+) -> None:
+    """Replace an index item while retaining the old remove-then-append order.
+
+    ``dict`` preserves insertion order.  Removing the existing conversation
+    before assigning it again is therefore equivalent to the previous
+    ``[... if convDir != current]`` plus ``append`` implementation, without
+    rescanning the complete index for every conversation.
+    """
+
+    conv_dir = str(item.get("convDir") or "")
+    index.pop(conv_dir, None)
+    index[conv_dir] = item
+
+
 def _html_export_folder_sessions_js(session_items: list[dict[str, Any]]) -> str:
     """生成增量 HTML 共用的会话目录；字段只取已经过隐私处理的会话摘要。"""
 
@@ -1424,7 +1441,7 @@ def _media_kinds_from_selected_types(selected_render_types: Optional[set[str]]) 
     # even when users only select `chatHistory` in the renderType filter.
     if "chathistory" in selected_render_types:
         out.update({"image", "emoji", "video", "video_thumb", "voice", "file"})
-    if "image" in selected_render_types:
+    if "image" in selected_render_types or "link" in selected_render_types:
         out.add("image")
     if "emoji" in selected_render_types:
         out.add("emoji")
@@ -1928,7 +1945,9 @@ class ChatExportManager:
                 "messageTypes": list(message_types),
                 "outputDir": str(output_dir),
                 "allowProcessKeyExtract": False,
-                "downloadRemoteMedia": True,
+                # Prepared archives (favorites/records) have no interactive
+                # HTML options panel; keep their default offline and fast.
+                "downloadRemoteMedia": False,
                 "htmlPageSize": 1000,
                 "privacyMode": False,
                 "fileName": str(file_name or "").strip(),
@@ -2469,9 +2488,17 @@ class ChatExportManager:
                     native_integrity=None if folder_context is not None else native_integrity,
                 )
                 _safe_trace(trace, "zip_opened", durationMs=_elapsed_ms(phase_started))
+                # Keep the indexes keyed by conversation directory while the
+                # export is running.  Folder exports replace existing entries
+                # and intentionally move them to the end; dict pop+assign
+                # preserves that order in O(1), unlike filtering a growing
+                # list for every conversation.
+                html_index_by_conv_dir: dict[str, dict[str, Any]] = {}
+                excel_index_by_conv_dir: dict[str, dict[str, Any]] = {}
                 html_index_items: list[dict[str, Any]] = []
                 excel_index_items: list[dict[str, Any]] = []
                 self_avatar_path = ""
+                session_items_by_conv_dir: dict[str, dict[str, Any]] = {}
                 session_items: list[dict[str, Any]] = []
                 if folder_context is not None:
                     old_conversations = (
@@ -2485,13 +2512,17 @@ class ChatExportManager:
                         old_session = old_value.get("session")
                         has_old_session = False
                         if isinstance(old_session, dict) and str(old_session.get("convDir") or "").strip():
-                            session_items.append(dict(old_session))
+                            _replace_ordered_export_index_item(
+                                session_items_by_conv_dir,
+                                dict(old_session),
+                            )
                             has_old_session = True
                         old_meta = old_value.get("meta")
                         old_directory = str(old_value.get("directory") or "").strip()
                         if old_directory and not has_old_session:
                             meta_value = dict(old_meta) if isinstance(old_meta, dict) else {}
-                            session_items.append(
+                            _replace_ordered_export_index_item(
+                                session_items_by_conv_dir,
                                 {
                                     "username": str(meta_value.get("username") or "").strip(),
                                     "displayName": (
@@ -2503,12 +2534,13 @@ class ChatExportManager:
                                     "avatarPath": str(meta_value.get("avatarPath") or "").strip(),
                                     "lastTimeText": "",
                                     "previewText": "",
-                                }
+                                },
                             )
                         if isinstance(old_meta, dict) and old_directory:
                             item = {"convDir": old_directory, "meta": dict(old_meta)}
-                            html_index_items.append(item)
-                            excel_index_items.append(item)
+                            _replace_ordered_export_index_item(html_index_by_conv_dir, item)
+                            _replace_ordered_export_index_item(excel_index_by_conv_dir, item)
+                    session_items = list(session_items_by_conv_dir.values())
                 remote_written: dict[str, str] = {}
                 remote_download_enabled = bool(download_remote_media) and (export_format == "html") and include_media and (not privacy_mode)
                 if export_format == "html":
@@ -2724,11 +2756,11 @@ class ChatExportManager:
                             "lastTimeText": ("" if privacy_mode else _format_session_time(last_ts_by_username.get(conv_username))),
                             "previewText": ("" if privacy_mode else str(preview_by_username.get(conv_username) or "")),
                         }
-                        session_items = [
-                            item for item in session_items
-                            if str(item.get("convDir") or "") != conv_dir
-                        ]
-                        session_items.append(session_value)
+                        _replace_ordered_export_index_item(
+                            session_items_by_conv_dir,
+                            session_value,
+                        )
+                    session_items = list(session_items_by_conv_dir.values())
                     _safe_trace(
                         trace,
                         "html_session_index_built",
@@ -3318,29 +3350,21 @@ class ChatExportManager:
                         if isinstance(old_meta, dict):
                             effective_meta = dict(old_meta)
                     if export_format == "html":
-                        html_index_items = [
-                            item for item in html_index_items
-                            if str(item.get("convDir") or "") != conv_dir
-                        ]
-                        html_index_items.append({"convDir": conv_dir, "meta": effective_meta})
+                        _replace_ordered_export_index_item(
+                            html_index_by_conv_dir,
+                            {"convDir": conv_dir, "meta": effective_meta},
+                        )
                     elif export_format == "excel":
-                        excel_index_items = [
-                            item for item in excel_index_items
-                            if str(item.get("convDir") or "") != conv_dir
-                        ]
-                        excel_index_items.append({"convDir": conv_dir, "meta": effective_meta})
+                        _replace_ordered_export_index_item(
+                            excel_index_by_conv_dir,
+                            {"convDir": conv_dir, "meta": effective_meta},
+                        )
 
                     if folder_context is not None and conv_key:
                         previous_state = dict(incremental_old)
                         if incremental_should_render:
-                            session_value = next(
-                                (
-                                    dict(item)
-                                    for item in session_items
-                                    if str(item.get("convDir") or "") == conv_dir
-                                ),
-                                {},
-                            )
+                            session_item = session_items_by_conv_dir.get(conv_dir)
+                            session_value = dict(session_item) if isinstance(session_item, dict) else {}
                             pending_media = normalize_pending_media(
                                 [
                                     {
@@ -3429,6 +3453,12 @@ class ChatExportManager:
                         exportedCount=exported_count,
                     )
 
+                # Materialize each ordered index once after all conversation
+                # writes.  During the loop the keyed maps above avoid an O(N)
+                # filter for every item while retaining folder replacement
+                # order for the final HTML/Excel catalog.
+                html_index_items = list(html_index_by_conv_dir.values())
+                excel_index_items = list(excel_index_by_conv_dir.values())
                 if export_format == "html":
                     phase_started = time.perf_counter()
                     archive_title = str(opts.get("_archiveTitle") or "").strip() or "聊天记录"
@@ -4257,6 +4287,7 @@ def _normalize_realtime_message_item_for_export(
         sender_username=sender_username,
         is_sent=bool(is_sent),
         packed_info_data=_pick_case_insensitive_value(item, "packed_info_data", "packedInfoData", "PackedInfoData"),
+        msg_source=_pick_case_insensitive_value(item, "msg_source", "source", "msgSource"),
     )
 
 
@@ -4296,19 +4327,24 @@ def _iter_realtime_rows_for_conversation(
     )
     yielded = 0
     self_username = _wcdb_resolve_account_native_wxid(account_dir, rt_conn)
-    for item in source_rows:
-        if not isinstance(item, dict):
-            continue
-        row = _normalize_realtime_message_item_for_export(
-            item,
-            account_dir=account_dir,
-            conv_username=conv_username,
-            self_username=self_username,
-        )
-        if row.local_id <= 0:
-            continue
-        yielded += 1
-        yield row
+    try:
+        for item in source_rows:
+            if not isinstance(item, dict):
+                continue
+            row = _normalize_realtime_message_item_for_export(
+                item,
+                account_dir=account_dir,
+                conv_username=conv_username,
+                self_username=self_username,
+            )
+            if row.local_id <= 0:
+                continue
+            yielded += 1
+            yield row
+    finally:
+        # 消费者暂停或提前结束时，立即释放底层原生消息游标。
+        if hasattr(source_rows, 'close'):
+            source_rows.close()
     logger.info(
         "[chat-export] realtime message stream completed account=%s conversation=%s rows=%s",
         account_dir.name,
@@ -4401,6 +4437,7 @@ class _Row:
     sender_username: str
     is_sent: bool
     packed_info_data: Any = None
+    msg_source: Any = None
 
 
 def _iter_rows_for_conversation(
@@ -4434,7 +4471,7 @@ def _iter_rows_for_conversation(
     account_wxid = resolve_account_self_username(account_dir)
 
     def iter_db(db_path: Path) -> Iterable[_Row]:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(db_path.resolve().as_uri() + '?mode=ro', uri=True)
         conn.row_factory = sqlite3.Row
         try:
             table_name = _resolve_msg_table_name(conn, conv_username)
@@ -4463,8 +4500,11 @@ def _iter_rows_for_conversation(
 
             quoted = _quote_ident(table_name)
             has_packed_info_data = False
+            source_column = None
             try:
                 cols = conn.execute(f"PRAGMA table_info({quoted})").fetchall()
+                column_names = {_decode_sqlite_text(c[1]).strip().lower() for c in cols}
+                source_column = next((c for c in ('source', 'msg_source') if c in column_names), None)
                 has_packed_info_data = any(
                     _decode_sqlite_text(c[1]).strip().lower() == "packed_info_data" for c in cols
                 )
@@ -4490,6 +4530,8 @@ def _iter_rows_for_conversation(
             packed_select = (
                 "m.packed_info_data AS packed_info_data, " if has_packed_info_data else "NULL AS packed_info_data, "
             )
+            # AI 读取保留微信原始 @ 身份；旧库没有该列时仍可读取。
+            packed_select += f'm.{source_column} AS msg_source, ' if source_column else 'NULL AS msg_source, '
             sql_with_join = (
                 "SELECT "
                 "m.local_id, m.server_id, m.local_type, m.sort_seq, m.real_sender_id, m.create_time, "
@@ -4558,6 +4600,7 @@ def _iter_rows_for_conversation(
                         sender_username=sender_username,
                         is_sent=bool(is_sent),
                         packed_info_data=r["packed_info_data"],
+                        msg_source=r["msg_source"],
                     )
         finally:
             try:
@@ -4570,7 +4613,15 @@ def _iter_rows_for_conversation(
     def sort_key(r: _Row) -> tuple[int, int, int]:
         return (int(r.create_time or 0), int(r.sort_seq or 0), int(r.local_id or 0))
 
-    return heapq.merge(*streams, key=sort_key)
+    def merged_rows():
+        try:
+            yield from heapq.merge(*streams, key=sort_key)
+        finally:
+            # heapq.merge 不负责关闭输入流；需主动释放各分库的 SQLite 连接。
+            for stream in streams:
+                stream.close()
+
+    return merged_rows()
 
 
 def _incremental_row_key(row: _Row) -> tuple[int, int, int, int, str, str]:
@@ -7176,8 +7227,8 @@ def _write_conversation_html(
                         heading = str(msg.get("title") or msg.get("content") or safe_url).strip()
                         abstract = str(msg.get("content") or "").strip()
                         preview = str(msg.get("thumbUrl") or "").strip()
-                        preview_url = ""
-                        if is_http_url(preview):
+                        preview_url = offline_path(msg, "image")
+                        if not preview_url and is_http_url(preview):
                             local = maybe_download_remote_image(preview)
                             preview_url = local or preview
                         variant = str(msg.get("linkStyle") or "").strip().lower()
@@ -8228,6 +8279,40 @@ def _attach_offline_media(
 
     offline: list[dict[str, Any]] = []
 
+    if rt == "link" and "image" in media_kinds:
+        thumbnail = str(msg.get("thumbUrl") or "").strip()
+        # CDN 缩略图标识不是可访问的网址；优先查找该消息在会话附件目录中的本地图片。
+        if thumbnail and not thumbnail.lower().startswith(("http://", "https://")):
+            candidates: list[str] = []
+            try:
+                local_id, created = int(msg.get("localId") or 0), int(msg.get("createTime") or 0)
+                if local_id > 0 and created > 0:
+                    candidates.append(f"{local_id}_{created}")
+            except (TypeError, ValueError):
+                pass
+            if re.fullmatch(r"[0-9a-fA-F]{32,512}", thumbnail):
+                candidates.append(thumbnail)
+            arc, is_new, used_id = "", False, ""
+            for candidate in candidates:
+                arc, is_new = _materialize_media(
+                    zf=zf, account_dir=account_dir, conv_username=conv_username,
+                    kind="image", md5=candidate if _is_md5(candidate) else "", file_id=candidate,
+                    media_written=media_written, suggested_name="", media_index=media_index,
+                    require_image=True, cache_namespace=conv_username,
+                )
+                if arc:
+                    used_id = candidate
+                    break
+            if arc:
+                # 与 offlineMedia 一致，路径相对导出根目录；不写入用户机器的绝对路径。
+                msg["thumbUrl"] = arc
+                offline.append({"kind": "image", "path": arc, "fileId": used_id})
+                if is_new:
+                    with lock:
+                        job.progress.media_copied += 1
+            else:
+                record_missing("image", candidates[0] if candidates else thumbnail)
+
     if rt == "image" and "image" in media_kinds:
         primary_md5 = str(msg.get("imageMd5") or "").strip().lower()
         primary_file_id = str(msg.get("imageFileId") or "").strip()
@@ -8632,11 +8717,16 @@ def _materialize_media(
     media_written: dict[str, str],
     suggested_name: str,
     media_index: Optional[MediaPathIndex],
+    require_image: bool = False,
+    cache_namespace: str = "",
 ) -> tuple[str, bool]:
     started_at = time.perf_counter()
     ident = md5 or file_id
     if not ident:
         return "", False
+    if require_image:
+        # local_id 与时间戳可能跨会话重复；缩略图缓存和文件名都按会话隔离。
+        ident = "thumb_" + hashlib.sha256(f"{cache_namespace}\0{ident}".encode("utf-8")).hexdigest()[:32]
 
     key = f"{kind}:{ident}"
     if key in media_written:
@@ -8816,6 +8906,15 @@ def _materialize_media(
         except Exception:
             pass
 
+    if require_image and src is not None and re.fullmatch(r"\d+_\d+", file_id) and conv_username:
+        # 同秒本地消息编号不是全局唯一键，禁止索引兜底命中另一会话的附件目录。
+        parts = [part.lower() for part in Path(src).parts]
+        if "attach" in parts:
+            index = parts.index("attach")
+            expected = hashlib.md5(conv_username.encode("utf-8")).hexdigest()
+            if index + 1 >= len(parts) or parts[index + 1] != expected:
+                return "", False
+
     if not src:
         if media_index is not None:
             try:
@@ -8917,6 +9016,8 @@ def _materialize_media(
         try:
             data, mt = _read_and_maybe_decrypt_media(src, account_dir=account_dir)
         except Exception:
+            if require_image:
+                return "", False
             try:
                 zf.write(src, arcname=arc)
             except Exception:
@@ -8925,6 +9026,8 @@ def _materialize_media(
             return arc, True
 
         mt = str(mt or "").strip()
+        if require_image and _detect_image_media_type(data[:32]) not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+            return "", False
         if mt == "image/png":
             ext2 = "png"
         elif mt == "image/jpeg":

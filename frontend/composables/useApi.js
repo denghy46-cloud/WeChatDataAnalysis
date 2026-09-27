@@ -1,4 +1,5 @@
 import { reportServerError } from '~/lib/server-error-logging'
+import { aiDiagnostics, aiTrace } from '~/utils/aiDiagnostics'
 import {
   getLatestResourceTiming,
   isChatPerfLoggingEnabled,
@@ -49,9 +50,17 @@ export const useApi = () => {
   // 基础请求函数
   const request = async (url, options = {}) => {
     const fetchOptions = { ...options }
+    const aiScoped = !!fetchOptions.aiDiagnostic || /(?:retrieval_mode|retrievalMode)=hybrid/.test(url)
+    delete fetchOptions.aiDiagnostic
+    const aiTraceId = aiScoped ? aiTrace() : ''
+    if (aiScoped) {
+      const headers = new Headers(fetchOptions.headers || undefined)
+      headers.set('X-WCDA-AI-Trace', aiTraceId)
+      fetchOptions.headers = headers
+    }
     const perfTraceId = String(fetchOptions.perfTraceId || '').trim()
     delete fetchOptions.perfTraceId
-    const perfEnabled = !!perfTraceId && isChatPerfLoggingEnabled()
+    const perfEnabled = !aiScoped && !!perfTraceId && isChatPerfLoggingEnabled()
     const resourceUrl = perfEnabled ? resolveResourceTimingUrl(baseURL, url) : ''
     const sentEpochMs = perfEnabled ? Date.now() : 0
     const requestStartedAt = perfEnabled ? nowPerfMs() : 0
@@ -76,6 +85,12 @@ export const useApi = () => {
         baseURL,
         ...fetchOptions,
         async onResponseError({ response }) {
+          if (aiScoped) {
+            const error = new Error('AI 资料请求失败')
+            error.status = error.statusCode = response.status
+            error.diagnostic_id = response.headers?.get?.('X-WCDA-AI-Diagnostic')
+            throw error
+          }
           if (response.status >= 400 && response.status < 500) {
             const fallback = response.status === 400
               ? '请求参数错误'
@@ -100,6 +115,14 @@ export const useApi = () => {
       chatAccounts.applySourceResponse(response)
       return response
     } catch (error) {
+      if (aiScoped) {
+        aiDiagnostics(baseURL).record('request.failed', { origin: 'frontend', trace_id: aiTraceId, diagnostic_id: error?.diagnostic_id,
+          http_status: error?.status || error?.statusCode, component: 'source', method: options.method || 'GET' })
+        const safe = new Error('AI 资料请求失败')
+        safe.status = safe.statusCode = error?.status || error?.statusCode
+        safe.trace_id = aiTraceId; safe.diagnostic_id = error?.diagnostic_id
+        throw safe
+      }
       requestError = String(error?.message || error?.name || 'request failed')
       if (!isAbortRequestError(error)) {
         console.error('API请求错误:', error)
@@ -284,6 +307,8 @@ export const useApi = () => {
 
   const searchChatMessages = async (params = {}) => {
     const query = new URLSearchParams()
+    if (params.retrieval_mode) query.set('retrieval_mode', params.retrieval_mode)
+    if (params.search_ticket) query.set('search_ticket', params.search_ticket)
     if (params && params.account) query.set('account', params.account)
     if (params && params.q) query.set('q', params.q)
     if (params && params.username) query.set('username', params.username)
@@ -349,7 +374,7 @@ export const useApi = () => {
     if (params && params.after != null) query.set('after', String(params.after))
     if (params && params.source) query.set('source', params.source)
     const url = '/chat/messages/around' + (query.toString() ? `?${query.toString()}` : '')
-    return await request(url)
+    return await request(url, { aiDiagnostic: !!params.ai_diagnostic })
   }
 
   // 聊天记录日历热力图：某月每日消息数
@@ -361,7 +386,37 @@ export const useApi = () => {
     if (params && params.month != null) query.set('month', String(params.month))
     if (params && params.source) query.set('source', params.source)
     const url = '/chat/messages/daily_counts' + (query.toString() ? `?${query.toString()}` : '')
-    return await request(url)
+    // 外部 signal 存在时也必须生效；部分 fetch 包装器会跳过自身的 timeout。
+    const controller = new AbortController()
+    const abort = () => controller.abort(params.signal?.reason)
+    let rejectAbort
+    const aborted = new Promise((_, reject) => { rejectAbort = reject })
+    const onAbort = () => rejectAbort(controller.signal.reason || new DOMException('请求已取消', 'AbortError'))
+    controller.signal.addEventListener('abort', onAbort, { once: true })
+    params.signal?.addEventListener('abort', abort, { once: true })
+    if (params.signal?.aborted) abort()
+    const timer = setTimeout(() => {
+      controller.abort(new DOMException('加载日历超时，请重试', 'TimeoutError'))
+    }, 20_000)
+    try {
+      if (controller.signal.aborted) return await aborted
+      return await Promise.race([
+        aborted,
+        request(url, { signal: controller.signal, timeout: 20_000, retry: 0 })
+      ])
+    } catch (error) {
+      if (controller.signal.reason?.name === 'TimeoutError') {
+        throw new Error('加载日历超时，请重试')
+      }
+      if (controller.signal.aborted) throw controller.signal.reason || error
+      // 保留后端的中文错误，网络错误使用可读的中文提示。
+      if (error?.status || error?.statusCode) throw error
+      throw new Error('加载日历失败，请检查连接后重试')
+    } finally {
+      clearTimeout(timer)
+      params.signal?.removeEventListener('abort', abort)
+      controller.signal.removeEventListener('abort', onAbort)
+    }
   }
 
   // 聊天记录定位锚点：某日第一条 / 会话最早一条
@@ -441,6 +496,28 @@ export const useApi = () => {
     if (params && params.account) query.set('account', params.account)
     const url = '/sns/snapshot/status' + (query.toString() ? `?${query.toString()}` : '')
     return await request(url)
+  }
+
+  const startSnsFullSync = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params && params.account) query.set('account', params.account)
+    const url = '/sns/realtime/full_sync' + (query.toString() ? `?${query.toString()}` : '')
+    return await request(url, { method: 'POST' })
+  }
+
+  const getSnsFullSyncStatus = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params && params.account) query.set('account', params.account)
+    const url = '/sns/realtime/full_sync/status' + (query.toString() ? `?${query.toString()}` : '')
+    return await request(url)
+  }
+
+  const cancelSnsFullSync = async (params = {}) => {
+    const query = new URLSearchParams()
+    if (params && params.account) query.set('account', params.account)
+    if (params && params.sync_id) query.set('sync_id', String(params.sync_id))
+    const url = '/sns/realtime/full_sync' + (query.toString() ? `?${query.toString()}` : '')
+    return await request(url, { method: 'DELETE' })
   }
 
   const openChatMediaFolder = async (params = {}) => {
@@ -766,6 +843,8 @@ export const useApi = () => {
     if (params && params.keyword) query.set('keyword', params.keyword)
     if (params && params.include_friends != null) query.set('include_friends', String(!!params.include_friends))
     if (params && params.include_groups != null) query.set('include_groups', String(!!params.include_groups))
+    if (params && params.include_enterprise_friends != null) query.set('include_enterprise_friends', String(!!params.include_enterprise_friends))
+    if (params && params.include_enterprise_groups != null) query.set('include_enterprise_groups', String(!!params.include_enterprise_groups))
     if (params && params.include_officials != null) query.set('include_officials', String(!!params.include_officials))
     if (params && params.include_official_subscriptions != null) query.set('include_official_subscriptions', String(!!params.include_official_subscriptions))
     if (params && params.include_official_services != null) query.set('include_official_services', String(!!params.include_official_services))
@@ -805,6 +884,17 @@ export const useApi = () => {
     return await request(url, params?.signal ? { signal: params.signal } : {})
   }
 
+  const getChatGroupMembers = async (params) => {
+    const query = new URLSearchParams({
+      account: params.account,
+      username: params.username,
+      limit: String(params.limit ?? 40),
+      offset: String(params.offset ?? 0),
+      source: 'auto'
+    })
+    return await request(`/chat/contacts/group_members?${query}`, { signal: params.signal })
+  }
+
   const exportChatContacts = async (payload = {}) => {
     return await request('/chat/contacts/export', {
       method: 'POST',
@@ -818,6 +908,8 @@ export const useApi = () => {
         contact_types: {
           friends: payload?.contact_types?.friends == null ? true : !!payload.contact_types.friends,
           groups: payload?.contact_types?.groups == null ? true : !!payload.contact_types.groups,
+          enterprise_friends: payload?.contact_types?.enterprise_friends == null ? null : !!payload.contact_types.enterprise_friends,
+          enterprise_groups: payload?.contact_types?.enterprise_groups == null ? null : !!payload.contact_types.enterprise_groups,
           officials: payload?.contact_types?.officials == null ? true : !!payload.contact_types.officials,
           official_subscriptions: payload?.contact_types?.official_subscriptions == null ? null : !!payload.contact_types.official_subscriptions,
           official_services: payload?.contact_types?.official_services == null ? null : !!payload.contact_types.official_services,
@@ -900,12 +992,13 @@ export const useApi = () => {
   }
 
   const getMacosKeyCaptureStatus = async (params = {}) => {
-    return await request('/macos-key-capture/status', params?.signal ? { signal: params.signal } : {})
+    return await request('/macos-key-capture/status', { retry: 0, timeout: 3000, ...(params?.signal ? { signal: params.signal } : {}) })
   }
 
   const macosKeyCaptureRequest = async (action, params = {}) => {
     const options = {
       method: 'POST',
+      retry: 0,
       body: {
         wechat_install_path: params.wechat_install_path || null,
         db_storage_path: params.db_storage_path || null,
@@ -1092,6 +1185,21 @@ export const useApi = () => {
     return await request('/system/cdn_image/status' + (q ? `?account=${encodeURIComponent(q)}` : ''))
   }
 
+  // WxCDN 套餐 / 额度 / 兑换（后端 routers/cdn.py）
+  const getCdnPlan = async (account = '', { refresh = false } = {}) => {
+    const params = new URLSearchParams()
+    if (String(account || '').trim()) params.set('account', String(account).trim())
+    if (refresh) params.set('refresh', 'true')
+    const q = params.toString()
+    return await request('/cdn/plan' + (q ? `?${q}` : ''))
+  }
+  const connectCdn = async (account = '') => {
+    return await request('/cdn/connect', { method: 'POST', body: { account: String(account || '').trim() } })
+  }
+  const redeemCdnCode = async (account, code) => {
+    return await request('/cdn/redeem', { method: 'POST', body: { account: String(account || '').trim(), code: String(code || '') } })
+  }
+
   const toggleCdnImage = async (enabled) => {
     return await request('/system/cdn_image/toggle', {
       method: 'POST',
@@ -1119,6 +1227,9 @@ export const useApi = () => {
     toggleCdnImage,
     getWechatUpdateGuardStatus,
     toggleWechatUpdateGuard,
+    getCdnPlan,
+    connectCdn,
+    redeemCdnCode,
     detectWechat,
     detectCurrentAccount,
     decryptDatabase,
@@ -1150,6 +1261,9 @@ export const useApi = () => {
     listSnsUsers,
     syncSnsRealtimeLatest,
     getSnsSnapshotStatus,
+    startSnsFullSync,
+    getSnsFullSyncStatus,
+    cancelSnsFullSync,
     openChatMediaFolder,
     downloadChatEmoji,
     saveMediaKeys,
@@ -1183,6 +1297,7 @@ export const useApi = () => {
     cancelSnsExport,
     listChatContacts,
     getChatContactProfile,
+    getChatGroupMembers,
     exportChatContacts,
     createAccountArchiveExport,
     getAccountArchiveExport,

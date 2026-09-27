@@ -21,6 +21,28 @@ test("desktop package excludes the retired Koffi and WCDB sidecar runtime", () =
   assert.ok(packageJson.build.files.includes("!src/wcdb-sidecar.cjs"));
 });
 
+test("desktop package keeps Electron run-as-node enabled for the SNS WASM helper", () => {
+  assert.equal(packageJson.build.electronFuses?.runAsNode, true);
+  assert.equal(packageJson.build.electronFuses?.resetAdHocDarwinSignature, true);
+});
+
+test("SNS media CI covers Windows x64 and macOS arm64 without release secrets", () => {
+  const workflow = fs.readFileSync(
+    path.join(repoRoot, ".github", "workflows", "sns-media-cross-platform.yml"),
+    "utf8",
+  );
+  assert.match(workflow, /workflow_dispatch:/);
+  assert.match(workflow, /pull_request:/);
+  assert.match(workflow, /os:\s*windows-2022/);
+  assert.match(workflow, /arch:\s*x64/);
+  assert.match(workflow, /os:\s*macos-14/);
+  assert.match(workflow, /arch:\s*arm64/);
+  assert.match(workflow, /tests\/sns-wasm-runtime\.test\.cjs/);
+  assert.match(workflow, /tests\/sns-media-source\.test\.mjs/);
+  assert.match(workflow, /tests\/test_sns_media\.py/);
+  assert.doesNotMatch(workflow, /secrets\.|environment:\s*windows-private-pki-production/);
+});
+
 test("development launcher owns the Electron process tree directly", () => {
   const source = fs.readFileSync(path.join(desktopRoot, "scripts", "dev.cjs"), "utf8");
   assert.match(source, /const electronCommand = require\("electron"\);/);
@@ -108,6 +130,8 @@ test("Windows release uses protected cloud private-PKI signing and installer smo
   assert.match(smokeSource, /wechatdb_broker\.exe/);
   assert.match(smokeSource, /\/api\/health/);
   assert.match(smokeSource, /smokeElectronApp/);
+  assert.match(smokeSource, /smokeElectronNodeWasm/);
+  assert.match(smokeSource, /smokePackagedBackendWasm/);
   assert.match(smokeSource, /AUTO_UPDATE_ENABLED:\s*"0"/);
 
   const workflow = fs
@@ -116,6 +140,9 @@ test("Windows release uses protected cloud private-PKI signing and installer smo
   const windowsJob = workflow.match(
     /\n  build-windows:\n([\s\S]*?)(?=\n  [A-Za-z0-9_-]+:\n|$)/
   )?.[1] || "";
+  const rebuildRelease = fs.readFileSync(
+    path.join(repoRoot, "tools", "rebuild_wcdb_release.py"), "utf8"
+  );
   assert.match(windowsJob, /runs-on:\s*windows-2022/);
   assert.match(windowsJob, /environment:\s*windows-private-pki-production/);
   assert.match(windowsJob, /fetch-depth:\s*0/);
@@ -154,14 +181,17 @@ test("Windows release uses protected cloud private-PKI signing and installer smo
   assert.match(windowsJob, /WCE_NATIVE_CORE_SOURCE_REVISION/);
   assert.match(windowsJob, /WCE_NATIVE_CORE_BUILD_ID/);
   assert.match(windowsJob, /WCE_NATIVE_CORE_ARTIFACT_SHA256/);
-  assert.match(windowsJob, /WCE_NATIVE_CORE_ARTIFACT_READ_TOKEN/);
-  assert.match(windowsJob, /gh release download \$releaseTag/);
+  assert.match(windowsJob, /WCE_NATIVE_CORE_PRODUCER_TOKEN/);
+  assert.match(windowsJob, /python tools\/rebuild_wcdb_release\.py/);
+  assert.match(windowsJob, /--component windows-native/);
   assert.match(
-    windowsJob,
-    /wechatdb-native-windows-x64-production-\$env:NATIVE_BUILD_ID\.zip/
+    rebuildRelease,
+    /"windows-native":\s*\(\s*"windows-native-production\.yml",\s*"wechatdb-native-windows-x64-source-public"/
   );
-  assert.match(windowsJob, /Get-FileHash -LiteralPath \$archivePath -Algorithm SHA256/);
-  assert.match(windowsJob, /Expand-Archive -LiteralPath \$archivePath/);
+  assert.match(rebuildRelease, /tag = f"\{component\}-\{build_id\}"/);
+  assert.match(rebuildRelease, /asset_name = f"\{artifact_name\}-\{build_id\}\.zip"/);
+  assert.match(rebuildRelease, /release\.get\("target_commitish"\) != revision/);
+  assert.match(rebuildRelease, /expected_digest = asset\.get\("digest"\)/);
   assert.match(windowsJob, /WCE_WINDOWS_PRIVATE_ROOT_CERT_PATH/);
   assert.match(windowsJob, /WCE_WINDOWS_PRIVATE_ROOT_SHA256/);
   assert.match(windowsJob, /WCE_RFC3161_TIMESTAMP_URL/);
@@ -220,18 +250,20 @@ test("Windows release uses protected cloud private-PKI signing and installer smo
   assert.match(windowsJob, /WORKFLOW_RUN_ID:\s*\$\{\{ github\.run_id \}\}/);
   assert.match(windowsJob, /WORKFLOW_RUN_ATTEMPT:\s*\$\{\{ github\.run_attempt \}\}/);
 
-  const downloadIndex = windowsJob.indexOf("gh release download $releaseTag");
-  const archiveHashIndex = windowsJob.indexOf("Get-FileHash -LiteralPath $archivePath");
-  const expandIndex = windowsJob.indexOf("Expand-Archive -LiteralPath $archivePath");
+  const rebuildIndex = windowsJob.indexOf("python tools/rebuild_wcdb_release.py");
+  const archiveHashIndex = rebuildRelease.indexOf('digest = hashlib.file_digest(archive, "sha256")');
+  const verifyHashIndex = rebuildRelease.indexOf('f"sha256:{digest}" != expected_digest');
+  const expandIndex = rebuildRelease.indexOf("package.extractall(destination)");
   const importIndex = windowsJob.indexOf("Import-WindowsCloudSigningIdentity.ps1");
-  const validateIndex = windowsJob.indexOf("Validate native production artifact");
+  const validateIndex = windowsJob.indexOf("Validate native source-public artifact");
   const pythonDependenciesIndex = windowsJob.indexOf("Install Python dependencies");
   const pythonTestsIndex = windowsJob.indexOf("Run focused Python release tests");
   const buildIndex = windowsJob.indexOf("Build Windows installer");
   const uploadIndex = windowsJob.indexOf("Upload Windows release files");
   const cleanupIndex = windowsJob.indexOf("Remove-WindowsCloudSigningIdentity.ps1");
-  assert.ok(downloadIndex >= 0 && downloadIndex < archiveHashIndex);
-  assert.ok(archiveHashIndex < expandIndex && expandIndex < importIndex);
+  assert.ok(rebuildIndex >= 0 && rebuildIndex < importIndex);
+  assert.ok(archiveHashIndex >= 0 && archiveHashIndex < verifyHashIndex);
+  assert.ok(verifyHashIndex < expandIndex);
   assert.ok(importIndex < validateIndex);
   assert.ok(
     validateIndex < pythonDependenciesIndex && pythonDependenciesIndex < pythonTestsIndex

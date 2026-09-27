@@ -1,3 +1,4 @@
+const { aiPackagingArgs, runPackagedAiSmoke } = require('./ai-packaging.cjs');
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -97,6 +98,13 @@ function nativeCoreManifestErrors(manifest) {
   }
   if (manifest.schemaVersion === 2 && Object.prototype.hasOwnProperty.call(manifest, "platform")) {
     errors.push("schemaVersion 2 must not declare platform");
+  }
+  if (manifest.schemaVersion === 2 && manifest.readOnlyBuild !== true) {
+    errors.push("readOnlyBuild must equal true");
+  }
+  if (manifest.schemaVersion === 2 &&
+      (!Array.isArray(manifest.wechatActions) || manifest.wechatActions.length !== 0)) {
+    errors.push("wechatActions must be an empty array");
   }
   if (manifest.schemaVersion === 2) {
     errors.push(...windowsNativeAsrManifestErrors(manifest));
@@ -386,6 +394,17 @@ function buildIntegrityNativeBinary({ env = process.env, platform = process.plat
 }
 
 function validateRuntimeNativeHelpers(destinationDir, platform = process.platform) {
+  for (const name of [
+    "weflow_wasm_keystream.js",
+    "wasm_video_decode.js",
+    "wasm_video_decode.wasm",
+    "sns_image_fixture.json",
+  ]) {
+    const resource = path.join(destinationDir, "weflow_wasm", name);
+    if (!fs.existsSync(resource) || !fs.statSync(resource).isFile()) {
+      throw new Error(`Missing SNS WASM runtime resource: ${resource}`);
+    }
+  }
   if (platform !== "darwin") return;
   const imageScanHelper = path.join(destinationDir, "macos", "universal", "image_scan_helper");
   if (!fs.existsSync(imageScanHelper)) {
@@ -633,9 +652,21 @@ function main() {
     "--collect-all",
     "opencc",
     "--collect-all",
+    "sherpa_onnx",
+    "--add-data",
+    pyInstallerAddData(path.join(repoRoot, "src/wechat_decrypt_tool/resources/voice_models.json"), "wechat_decrypt_tool/resources"),
+    "--collect-all",
     "watchfiles",
+    ...aiPackagingArgs(repoRoot),
     entry,
   ];
+
+  // CUDA/PyTorch 体积较大，仅在明确构建 Qwen GPU 版本时收集。
+  if (process.argv.includes("--qwen-gpu")) {
+    args.splice(args.length - 1, 0, "--collect-all", "torch", "--collect-all", "transformers");
+  } else {
+    args.splice(args.length - 1, 0, "--exclude-module", "torch", "--exclude-module", "transformers");
+  }
 
   if (process.platform === "win32") {
     args.splice(
@@ -669,6 +700,7 @@ function main() {
   );
   runPackagedOpenccSmoke(packagedBackend);
   runPackagedWatchfilesSmoke(packagedBackend);
+  runPackagedAiSmoke(packagedBackend);
 
   // Keep native dependencies outside the onefile extraction directory so the
   // broker and client library have stable paths at runtime.

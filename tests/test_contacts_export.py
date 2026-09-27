@@ -173,6 +173,9 @@ class TestContactsExport(unittest.TestCase):
                 )
                 """
             )
+            conn.execute(
+                "CREATE TABLE chat_room_info_detail (username_ TEXT, announcement_ TEXT)"
+            )
 
             friend_extra_buffer = self._build_extra_buffer(
                 country="CN",
@@ -280,6 +283,10 @@ class TestContactsExport(unittest.TestCase):
                     "",
                     b"",
                 ),
+            )
+            conn.execute(
+                "INSERT INTO chat_room_info_detail VALUES (?, ?)",
+                ("room@chatroom", "群公告完整内容"),
             )
             conn.commit()
         finally:
@@ -622,6 +629,12 @@ class TestContactsExport(unittest.TestCase):
                 with (
                     patch.object(chat_contacts.WCDB_REALTIME, "ensure_connected", return_value=rt_conn),
                     patch.object(chat_contacts, "_wcdb_get_sessions", return_value=sessions),
+                    patch.object(chat_contacts, "_query_realtime_contact_rows", return_value=[
+                        {"username": "wxid_friend", "local_type": 1},
+                        {"username": "room@chatroom", "local_type": 2},
+                        {"username": "gh_service", "local_type": 1},
+                    ]),
+                    patch.object(chat_contacts, "_query_realtime_official_account_type_map", return_value={}),
                     patch.object(
                         chat_contacts,
                         "_wcdb_get_display_names",
@@ -813,6 +826,13 @@ class TestContactsExport(unittest.TestCase):
                 self.assertEqual(contact.get("displayName"), "不应计入联系人")
                 self.assertEqual(contact.get("nickname"), "不应计入联系人")
                 self.assertEqual(contact.get("type"), "friend")
+
+                group_resp = client.get(
+                    "/api/chat/contacts/profile",
+                    params={"account": account, "source": "decrypted", "username": "room@chatroom"},
+                )
+                self.assertEqual(group_resp.status_code, 200)
+                self.assertEqual(group_resp.json()["contact"].get("announcement"), "群公告完整内容")
             finally:
                 if prev is None:
                     os.environ.pop("WECHAT_TOOL_DATA_DIR", None)

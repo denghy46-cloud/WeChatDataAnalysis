@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import uuid
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -31,6 +32,7 @@ from ..media_helpers import _load_media_keys, _read_and_maybe_decrypt_media, _re
 from ..path_fix import PathFixRoute
 from ..perf_trace import create_perf_trace
 from ..sns_realtime_autosync import SNS_REALTIME_AUTOSYNC
+from ..sns_full_sync import SNS_FULL_SYNC
 from .. import sns_media as _sns_media
 from ..wcdb_realtime import (
     WCDBRealtimeError,
@@ -602,6 +604,11 @@ def _upsert_sns_timeline_rows_to_decrypted_db(
                 len(rows),
                 error_text,
             )
+            logger.warning(
+                "[sns.incremental-sync] status=error phase=writing prepared=%s error_type=%s",
+                len(rows),
+                type(e).__name__,
+            )
             try:
                 conn.rollback()
             except Exception:
@@ -904,7 +911,8 @@ def _parse_timeline_xml(xml_text: str, fallback_username: str) -> dict[str, Any]
         "type": 1,  # 默认类型
         "title": "",
         "contentUrl": "",
-        "finderFeed": {}
+        "finderFeed": {},
+        "finderLive": {},
     }
 
     xml_str = _decode_sns_text_blob(xml_text)
@@ -1025,21 +1033,54 @@ def _parse_timeline_xml(xml_text: str, fallback_username: str) -> dict[str, Any]
             "url": _clean_url(_find_text(".//finderFeed/mediaList/media/url"))
         }
 
+    if post_type == 34:
+        out["finderLive"] = {
+            "id": _find_text(".//finderLive/finderLiveID"),
+            "username": _find_text(".//finderLive/finderUsername"),
+            "objectId": _find_text(".//finderLive/finderObjectID"),
+            "nonceId": _find_text(".//finderLive/finderNonceID"),
+            "nickname": _find_text(".//finderLive/nickname"),
+            "headUrl": _clean_url(_find_text(".//finderLive/headUrl")),
+            "desc": _find_text(".//finderLive/desc"),
+            "liveStatus": _safe_int(_find_text(".//finderLive/liveStatus")),
+            "coverUrl": _clean_url(
+                _find_text(".//finderLive/media/coverUrl", ".//finderLive/coverUrl")
+            ),
+            "width": _safe_int(_find_text(".//finderLive/media/width")),
+            "height": _safe_int(_find_text(".//finderLive/media/height")),
+        }
+
     media: list[dict[str, Any]] = []
     try:
-        for m in root.findall(".//mediaList//media"):
-            mt = _safe_int(m.findtext("type"))
-            url_el = m.find("url") if m.find("url") is not None else m.find("urlV")
-            thumb_el = m.find("thumb") if m.find("thumb") is not None else m.find("thumbV")
+        media_nodes = list(root.findall(".//mediaList//media"))
+        media_nodes.extend(root.findall(".//finderLive/media"))
+        for m in media_nodes:
+            mt = _safe_int(m.findtext("type") or m.findtext("mediaType"))
+
+            def _first_media_child(*names: str) -> Optional[ET.Element]:
+                for name in names:
+                    element = m.find(name)
+                    if element is not None:
+                        return element
+                return None
+
+            url_el = _first_media_child("url", "urlV", "coverUrl")
+            thumb_el = _first_media_child("thumb", "thumbV", "thumbUrl", "coverUrl")
 
             url = _clean_url(url_el.text if url_el is not None else "")
             thumb = _clean_url(thumb_el.text if thumb_el is not None else "")
 
             url_attrs = dict(url_el.attrib) if url_el is not None and url_el.attrib else {}
             thumb_attrs = dict(thumb_el.attrib) if thumb_el is not None and thumb_el.attrib else {}
-            media_id = str(m.findtext("id") or "").strip()
+            media_id = str(m.findtext("id") or m.findtext("mediaId") or "").strip()
             size_el = m.find("size")
             size = dict(size_el.attrib) if size_el is not None and size_el.attrib else {}
+            width = str(m.findtext("width") or "").strip()
+            height = str(m.findtext("height") or "").strip()
+            if width and not size.get("width"):
+                size["width"] = width
+            if height and not size.get("height"):
+                size["height"] = height
 
             if not url and not thumb:
                 continue
@@ -1131,8 +1172,8 @@ def _parse_timeline_xml(xml_text: str, fallback_username: str) -> dict[str, Any]
             token = _direct_child_text(img, "token")
             key = _direct_child_text(img, "key")
             enc_idx = _direct_child_text(img, "enc_idx", "encidx")
-            thumb_token = _direct_child_text(img, "thumb_url_token", "thumb_token", "thumburltoken") or token
-            thumb_key = _direct_child_text(img, "thumb_key", "thumbkey") or key
+            thumb_token = _direct_child_text(img, "thumb_url_token", "thumb_token", "thumburltoken")
+            thumb_key = _direct_child_text(img, "thumb_key", "thumbkey")
             thumb_enc_idx = _direct_child_text(img, "thumb_enc_idx", "thumbencidx")
             media_id = _direct_child_text(img, "media_id", "mediaid", "id")
             md5 = _direct_child_text(img, "md5")
@@ -1863,6 +1904,28 @@ async def stream_sns_realtime_events(request: Request, account: Optional[str] = 
     )
 
 
+@router.post("/api/sns/realtime/full_sync", summary="启动朋友圈全量缓存同步")
+def start_sns_realtime_full_sync(account: Optional[str] = None):
+    account_dir = _resolve_account_dir(account)
+    job, reused = SNS_FULL_SYNC.start(account_dir)
+    return {"status": "ok", "reused": reused, "job": job}
+
+
+@router.get("/api/sns/realtime/full_sync/status", summary="获取朋友圈全量同步状态")
+def get_sns_realtime_full_sync_status(account: Optional[str] = None):
+    account_dir = _resolve_account_dir(account)
+    return {"status": "ok", "job": SNS_FULL_SYNC.get(account_dir)}
+
+
+@router.delete("/api/sns/realtime/full_sync", summary="取消朋友圈全量缓存同步")
+def cancel_sns_realtime_full_sync(account: Optional[str] = None, sync_id: str = ""):
+    account_dir = _resolve_account_dir(account)
+    job, accepted = SNS_FULL_SYNC.cancel(account_dir, sync_id)
+    if not accepted:
+        raise HTTPException(status_code=409, detail="同步任务已结束或任务标识不匹配")
+    return {"status": "ok", "cancelled": True, "job": job}
+
+
 @router.post("/api/sns/realtime/sync_latest", summary="实时朋友圈同步到解密库（增量）")
 def sync_sns_realtime_timeline_latest(
     account: Optional[str] = None,
@@ -1876,6 +1939,12 @@ def sync_sns_realtime_timeline_latest(
     This is best-effort and intentionally **append-only**: we never delete rows from the decrypted snapshot
     even if the post is deleted/hidden later, so users can still browse/export historical cached content.
     """
+    sync_request_id = uuid.uuid4().hex
+    sync_started = time.perf_counter()
+    logger.info(
+        "[sns.incremental-sync] status=running request_id=%s phase=connecting",
+        sync_request_id,
+    )
     try:
         lim = int(max_scan or 200)
     except Exception:
@@ -1922,6 +1991,21 @@ def sync_sns_realtime_timeline_latest(
         result["highwaterAdvanced"] = bool(highwater_advanced)
         result["scanOffset"] = int(requested_scan_offset)
         result["scanLimit"] = int(lim)
+        status = str(result.get("status") or "error").strip().lower()
+        raw_code = str(result.get("error") or result.get("reason") or "").strip().lower()
+        code = raw_code if re.fullmatch(r"[a-z0-9_.-]{1,80}", raw_code) else ""
+        log_method = logger.error if status == "error" else logger.info
+        log_method(
+            "[sns.incremental-sync] status=%s request_id=%s phase=finalizing code=%s scanned=%s prepared=%s changed=%s unchanged=%s elapsed_ms=%s",
+            status,
+            sync_request_id,
+            code,
+            int(result.get("scanned") or 0),
+            int(prepared),
+            int(changed),
+            int(unchanged),
+            int((time.perf_counter() - sync_started) * 1000),
+        )
         return result
 
     # If there is no local decrypted sns.db yet, force a first-time materialization.
@@ -1934,6 +2018,11 @@ def sync_sns_realtime_timeline_latest(
     info = WCDB_REALTIME.get_status(account_dir)
     available = bool(info.get("dll_present") and info.get("key_present") and info.get("db_storage_dir"))
     if not available:
+        logger.error(
+            "[sns.incremental-sync] status=error request_id=%s phase=connecting code=realtime_not_available error_type=AvailabilityError elapsed_ms=%s",
+            sync_request_id,
+            int((time.perf_counter() - sync_started) * 1000),
+        )
         raise HTTPException(status_code=404, detail="WCDB realtime not available.")
 
     st = _read_sns_realtime_sync_state(account_dir)
@@ -1946,9 +2035,18 @@ def sync_sns_realtime_timeline_latest(
     if last_max_id_u <= 0:
         last_max_id_u = _max_sns_timeline_tid_unsigned_in_decrypted_sqlite(account_dir / "sns.db")
 
-    conn = WCDB_REALTIME.ensure_connected(account_dir)
+    try:
+        conn = WCDB_REALTIME.ensure_connected(account_dir)
+    except Exception as exc:
+        logger.error(
+            "[sns.incremental-sync] status=error request_id=%s phase=connecting code=connection_failed error_type=%s elapsed_ms=%s",
+            sync_request_id,
+            type(exc).__name__,
+            int((time.perf_counter() - sync_started) * 1000),
+        )
+        raise
 
-    t0 = time.perf_counter()
+    t0 = sync_started
     rows: list[dict[str, Any]] = []
     max_id_u = 0
     upsert_rows: list[tuple[int, str, str, Optional[Any]]] = []
@@ -2174,6 +2272,16 @@ def sync_sns_realtime_timeline_latest(
         write_success = changed_count == prepared_count
         write_error = ""
 
+    logger.info(
+        "[sns.incremental-sync] status=running request_id=%s phase=scanning batches=1 scanned=%s prepared=%s changed=%s unchanged=%s elapsed_ms=%s",
+        sync_request_id,
+        len(rows),
+        prepared_count,
+        changed_count,
+        unchanged_count,
+        int((time.perf_counter() - sync_started) * 1000),
+    )
+
     prepared_tids = {int(row[0]) for row in upsert_rows}
     missing_required_tids = required_tids - prepared_tids
     snapshot_complete = bool(upsert_rows) and all((
@@ -2186,6 +2294,15 @@ def sync_sns_realtime_timeline_latest(
         logger.warning(
             "[sns-sync] snapshot write incomplete account=%s scanned=%s prepared=%s changed=%s unchanged=%s missing_required=%s",
             account_dir.name,
+            len(rows),
+            prepared_count,
+            changed_count,
+            unchanged_count,
+            len(missing_required_tids),
+        )
+        logger.warning(
+            "[sns.incremental-sync] status=error request_id=%s phase=writing code=snapshot_write_incomplete scanned=%s prepared=%s changed=%s unchanged=%s skipped=%s",
+            sync_request_id,
             len(rows),
             prepared_count,
             changed_count,
@@ -2210,6 +2327,11 @@ def sync_sns_realtime_timeline_latest(
             len(rows),
             last_max_id_u,
         )
+        logger.warning(
+            "[sns.incremental-sync] status=skipped request_id=%s phase=scanning code=scan_cap_reached scanned=%s",
+            sync_request_id,
+            len(rows),
+        )
         return _sync_response({
             "status": "skipped",
             "reason": "backlog exceeds scan cap",
@@ -2228,6 +2350,10 @@ def sync_sns_realtime_timeline_latest(
         st2["updatedAt"] = int(time.time())
         if _write_sns_realtime_sync_state(account_dir, st2) is False:
             logger.warning("[sns-sync] state write failed account=%s", account_dir.name)
+            logger.warning(
+                "[sns.incremental-sync] status=error request_id=%s phase=finalizing code=sync_state_write_failed",
+                sync_request_id,
+            )
             return _sync_response({
                 "status": "error",
                 "error": "sync_state_write_failed",
@@ -2400,6 +2526,7 @@ def list_sns_timeline(
                     "title": parsed2.get("title", ""),
                     "contentUrl": parsed2.get("contentUrl", ""),
                     "finderFeed": parsed2.get("finderFeed", {}),
+                    "finderLive": parsed2.get("finderLive", {}),
                     "official": official2,
                 }
             )
@@ -2608,6 +2735,7 @@ def list_sns_timeline(
                     "title": parsed3.get("title", ""),
                     "contentUrl": parsed3.get("contentUrl", ""),
                     "finderFeed": parsed3.get("finderFeed", {}),
+                    "finderLive": parsed3.get("finderLive", {}),
                     "official": official3,
                 }
             )
@@ -2820,6 +2948,7 @@ def list_sns_timeline(
             title = ""
             content_url = ""
             finder_feed = {}
+            finder_live = {}
             try:
                 tid_u = int(r.get("id") or 0)
                 tid_s = (tid_u & 0xFFFFFFFFFFFFFFFF)
@@ -2842,6 +2971,7 @@ def list_sns_timeline(
                     title = parsed.get("title", "")
                     content_url = parsed.get("contentUrl", "")
                     finder_feed = parsed.get("finderFeed", {})
+                    finder_live = parsed.get("finderLive", {})
 
                     pcomments = parsed.get("comments") or []
                     if isinstance(pcomments, list) and pcomments:
@@ -2918,6 +3048,7 @@ def list_sns_timeline(
                     "title": title,
                     "contentUrl": content_url,
                     "finderFeed": finder_feed,
+                    "finderLive": finder_live,
                     "official": official,
                 }
             )
@@ -3165,8 +3296,19 @@ def _is_allowed_sns_media_host(host: str) -> bool:
     return _sns_media.is_allowed_sns_media_host(host)
 
 
-def _fix_sns_cdn_url(url: str, *, token: str = "", is_video: bool = False) -> str:
-    return _sns_media.fix_sns_cdn_url(url, token=token, is_video=is_video)
+def _fix_sns_cdn_url(
+    url: str,
+    *,
+    token: str = "",
+    is_video: bool = False,
+    force_original: bool = False,
+) -> str:
+    return _sns_media.fix_sns_cdn_url(
+        url,
+        token=token,
+        is_video=is_video,
+        force_original=force_original,
+    )
 
 
 def _detect_mp4_ftyp(head: bytes) -> bool:
@@ -3296,6 +3438,7 @@ async def _materialize_sns_remote_video(
     key: str,
     token: str,
     use_cache: bool,
+    diagnostic_id: str = "",
 ) -> Optional[Path]:
     return await _sns_media.materialize_sns_remote_video(
         account_dir=account_dir,
@@ -3303,6 +3446,7 @@ async def _materialize_sns_remote_video(
         key=key,
         token=token,
         use_cache=use_cache,
+        diagnostic_id=diagnostic_id,
     )
 
 
@@ -3449,6 +3593,7 @@ async def _try_fetch_and_decrypt_sns_remote(
     trace: Optional[Any] = None,
     diagnostic_id: str = "",
     stage: str = "remote",
+    force_original: bool = False,
 ) -> Optional[Response]:
     """Try remote download+decrypt first (accurate when keys are present)."""
     if trace is not None:
@@ -3461,6 +3606,7 @@ async def _try_fetch_and_decrypt_sns_remote(
         token=str(token or ""),
         use_cache=bool(use_cache),
         diagnostic_id=str(diagnostic_id or ""),
+        force_original=bool(force_original),
     )
     if res is None:
         if trace is not None:
@@ -3486,6 +3632,38 @@ async def _try_fetch_and_decrypt_sns_remote(
             cachePath=str(res.cache_path or ""),
         )
     return resp
+
+
+def _sns_remote_http_exception(
+    exc: BaseException,
+    *,
+    diagnostic_id: str,
+) -> HTTPException:
+    headers = {"X-SNS-Diagnostic-Id": str(diagnostic_id or "")}
+    if isinstance(exc, _sns_media.SnsWasmRuntimeUnavailable):
+        return HTTPException(
+            status_code=503,
+            detail="SNS media decryption runtime is unavailable.",
+            headers=headers,
+        )
+    if isinstance(
+        exc,
+        (_sns_media.SnsRemoteMediaDecodeError, _sns_media.SnsRemoteMediaUpstreamError),
+    ):
+        return HTTPException(
+            status_code=502,
+            detail="SNS CDN media could not be downloaded or decoded.",
+            headers=headers,
+        )
+    if isinstance(exc, HTTPException):
+        if exc.headers:
+            headers.update(exc.headers)
+        return HTTPException(status_code=exc.status_code, detail=exc.detail, headers=headers)
+    return HTTPException(
+        status_code=502,
+        detail="SNS CDN media processing failed.",
+        headers=headers,
+    )
 
 
 def _sns_media_value_hash(value: object) -> str:
@@ -3521,6 +3699,8 @@ def _sns_media_url_trace_fields(url: object) -> dict[str, Any]:
         "urlHost": host,
         "urlIdentity": _sns_media_value_hash(stable_url),
         "urlHasQuery": bool(has_query),
+        "sizeSuffix": _sns_media._sns_cdn_size_suffix(raw),
+        "mediaSource": _sns_media._sns_cdn_media_source(raw),
     }
 
 
@@ -3579,12 +3759,14 @@ async def get_sns_media(
     wxid_dir = _resolve_account_wxid_dir(account_dir)
 
     try:
-        use_cache_flag = bool(int(use_cache or 1))
+        use_cache_flag = bool(int(1 if use_cache is None else use_cache))
     except Exception:
         use_cache_flag = True
 
     variant_norm = str(variant or "").strip().lower()
-    prefer_remote_original = variant_norm in {"full", "origin", "original", "large"}
+    # `/0` is credential-bound and must never be inferred from a loose alias.
+    # Only the documented `variant=full` contract may request the original path.
+    prefer_remote_original = variant_norm == "full"
     post_type_i = int(post_type or 1)
     media_type_i = int(media_type or 2)
     md5_norm = _normalize_hex32(md5)
@@ -3620,19 +3802,30 @@ async def get_sns_media(
     )
     trace("request:start")
 
-    # 点击预览需要高清原图：本地 sns 缓存有时只命中缩略图，所以 full/original 请求先按
-    # WeFlow 的 CDN URL 修正 + token/key 解密链路取原图；失败后再回退本地缓存。
+    # 点击预览需要高清原图：本地 SNS 缓存有时只命中缩略图，所以 full/original 请求先按
+    # 原图 URL/token/key 链路取图；只有真实 404 才回退本地缓存，runtime/解密错误保持可诊断。
     if prefer_remote_original and str(url or "").strip():
-        remote_resp = await _try_fetch_and_decrypt_sns_remote(
-            account_dir=account_dir,
-            url=str(url or ""),
-            key=str(key or ""),
-            token=str(token or ""),
-            use_cache=use_cache_flag,
-            trace=trace,
-            diagnostic_id=request_id,
-            stage="remote-original",
-        )
+        try:
+            remote_resp = await _try_fetch_and_decrypt_sns_remote(
+                account_dir=account_dir,
+                url=str(url or ""),
+                key=str(key or ""),
+                token=str(token or ""),
+                use_cache=use_cache_flag,
+                trace=trace,
+                diagnostic_id=request_id,
+                stage="remote-original",
+                force_original=True,
+            )
+        except Exception as exc:
+            http_exc = _sns_remote_http_exception(exc, diagnostic_id=request_id)
+            trace(
+                "response:error",
+                result="remote-original-error",
+                statusCode=int(http_exc.status_code),
+                errorType=type(exc).__name__,
+            )
+            raise http_exc from exc
         if remote_resp is not None:
             remote_resp.headers["X-SNS-Variant"] = "full"
             remote_resp.headers["X-SNS-Diagnostic-Id"] = request_id
@@ -3825,16 +4018,26 @@ async def get_sns_media(
         trace("local-cache:skip", reason="use-cache-disabled")
 
     # 4) 最后再走远程：WeFlow 风格下载、解密和远程缓存。
-    remote_resp = await _try_fetch_and_decrypt_sns_remote(
-        account_dir=account_dir,
-        url=str(url or ""),
-        key=str(key or ""),
-        token=str(token or ""),
-        use_cache=use_cache_flag,
-        trace=trace,
-        diagnostic_id=request_id,
-        stage="remote-fallback",
-    )
+    try:
+        remote_resp = await _try_fetch_and_decrypt_sns_remote(
+            account_dir=account_dir,
+            url=str(url or ""),
+            key=str(key or ""),
+            token=str(token or ""),
+            use_cache=use_cache_flag,
+            trace=trace,
+            diagnostic_id=request_id,
+            stage="remote-fallback",
+        )
+    except Exception as exc:
+        http_exc = _sns_remote_http_exception(exc, diagnostic_id=request_id)
+        trace(
+            "response:error",
+            result="remote-fallback-error",
+            statusCode=int(http_exc.status_code),
+            errorType=type(exc).__name__,
+        )
+        raise http_exc from exc
     if remote_resp is not None:
         remote_resp.headers["X-SNS-Diagnostic-Id"] = request_id
         trace(
@@ -3886,7 +4089,11 @@ async def proxy_article_thumb(url: str):
             )
 
     except Exception as e:
-        logger.warning(f"[sns] 提取公众号封面失败 url={u[:50]}... : {e}")
+        logger.warning(
+            "[sns] article thumbnail failed urlIdentity=%s errorType=%s",
+            _sns_media_value_hash(u),
+            type(e).__name__,
+        )
         raise HTTPException(status_code=404, detail="无法获取文章封面")
 
 
@@ -3899,23 +4106,35 @@ async def get_sns_video_remote(
         use_cache: int = 1,
 ):
     account_dir = _resolve_account_dir(account)
+    request_id = f"sns-video-{time.time_ns()}-{threading.get_ident()}"
 
     try:
-        use_cache_flag = bool(int(use_cache or 1))
+        use_cache_flag = bool(int(1 if use_cache is None else use_cache))
     except Exception:
         use_cache_flag = True
 
-    path = await _materialize_sns_remote_video(
-        account_dir=account_dir,
-        url=str(url or ""),
-        key=str(key or ""),
-        token=str(token or ""),
-        use_cache=use_cache_flag,
-    )
+    try:
+        path = await _materialize_sns_remote_video(
+            account_dir=account_dir,
+            url=str(url or ""),
+            key=str(key or ""),
+            token=str(token or ""),
+            use_cache=use_cache_flag,
+            diagnostic_id=request_id,
+        )
+    except Exception as exc:
+        raise _sns_remote_http_exception(exc, diagnostic_id=request_id) from exc
     if path is None:
-        raise HTTPException(status_code=404, detail="SNS remote video not found.")
+        raise HTTPException(
+            status_code=404,
+            detail="SNS remote video not found.",
+            headers={"X-SNS-Diagnostic-Id": request_id},
+        )
 
-    headers = {"Cache-Control": "public, max-age=86400" if use_cache_flag else "no-store"}
+    headers = {
+        "Cache-Control": "public, max-age=86400" if use_cache_flag else "no-store",
+        "X-SNS-Diagnostic-Id": request_id,
+    }
 
     if use_cache_flag:
         return FileResponse(str(path), media_type="video/mp4", headers=headers)

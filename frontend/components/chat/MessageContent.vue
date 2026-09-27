@@ -84,12 +84,15 @@
                       <button
                         type="button"
                         class="whitespace-nowrap rounded border border-gray-200 bg-white px-2 py-1 text-xs text-gray-700 opacity-0 shadow-sm transition-opacity hover:bg-gray-50 focus:opacity-100 group-hover:opacity-100 disabled:cursor-wait disabled:opacity-60"
+                        :class="{ 'opacity-100': !!message._imageLargeLoading }"
                         :disabled="!!message._imageLargeLoading"
+                        :aria-busy="message._imageLargeLoading ? 'true' : 'false'"
                         title="先从微信本地目录查找大图；本地没有时通过原图接口获取。"
                         @click.stop.prevent="onTryLoadLargeImageClick(message)"
                       >
-                        {{ message._imageLargeLoading ? '获取中...' : '尝试加载大图' }}
+                        {{ message._imageLargeLoading ? '下载中...' : '尝试加载大图' }}
                       </button>
+                      <span v-if="message._imageLargeLoading" class="text-[11px] text-gray-500" role="status" aria-live="polite">正在触发原图下载，请稍候…</span>
                       <ErrorNotice
                         v-if="message._imageLargeError"
                         :message="message._imageLargeError"
@@ -691,7 +694,7 @@ export default defineComponent({
       const source = voiceTranscriptSourceKey(message)
       if (source === 'wechat') return '文字由微信客户端原生语音转文字能力生成'
       const model = String(message?.voiceTranscriptModel || '').trim()
-      if (source === 'project') return `文字由本项目本地 Whisper 转写（模型：${model}）`
+      if (source === 'project') return `文字由本项目本地模型转写（模型：${model}）`
       return '该转写记录没有来源标记'
     }
 

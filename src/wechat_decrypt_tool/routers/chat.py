@@ -80,6 +80,7 @@ from ..chat_helpers import (
 from ..media_helpers import _resolve_account_db_storage_dir, _try_find_decrypted_resource
 from ..app_paths import get_output_dir
 from ..chat_realtime_reader import (
+    fetch_daily_counts_via_exec as _shared_fetch_realtime_daily_counts_via_exec,
     fetch_anchor_via_exec as _shared_fetch_realtime_anchor_via_exec,
     fetch_context_via_exec as _shared_fetch_realtime_context_via_exec,
     fetch_rows_via_cursor as _shared_fetch_realtime_rows_via_cursor,
@@ -94,8 +95,10 @@ from ..session_last_message import (
     get_session_last_message_status,
     load_session_last_messages,
 )
+from ..sns_realtime_autosync import SNS_REALTIME_AUTOSYNC
 from ..sqlite_diagnostics import collect_sqlite_diagnostics, format_sqlite_diagnostics
 from ..source_fallback import build_source_fallback_meta
+from .chat_contacts import _load_enterprise_contact_info
 from ..wcdb_realtime import (
     WCDBRealtimeError,
     WCDB_REALTIME,
@@ -3855,6 +3858,7 @@ def _postprocess_full_messages(
     base_url: str,
     contact_db_path: Path,
     head_image_db_path: Path,
+    rt_conn: Any = None,
 ) -> None:
     _postprocess_transfer_messages(merged)
 
@@ -3950,6 +3954,7 @@ def _postprocess_full_messages(
         sender_usernames=uniq_senders,
     )
 
+    enterprise_contacts = _load_enterprise_contact_info(contact_db_path, sender_usernames, rt_conn=rt_conn)
     for m in merged:
         # If appmsg doesn't provide sourcedisplayname, try mapping sourceusername to display name.
         if (not str(m.get("from") or "").strip()) and str(m.get("fromUsername") or "").strip():
@@ -3964,6 +3969,7 @@ def _postprocess_full_messages(
 
         su = str(m.get("senderUsername") or "")
         if su:
+            m["senderEnterpriseName"] = enterprise_contacts.get(su, {}).get("enterpriseName", "")
             m["senderDisplayName"] = _resolve_sender_display_name(
                 sender_username=su,
                 sender_contact_rows=sender_contact_rows,
@@ -4156,6 +4162,9 @@ def _postprocess_full_messages(
 async def list_chat_accounts():
     """列出可用于聊天预览的账号（direct WCDB + legacy decrypted 兼容）。"""
     contexts = list_chat_account_contexts()
+    for ctx in contexts:
+        if ctx.mode == "direct" and ctx.db_key_present:
+            SNS_REALTIME_AUTOSYNC.ensure_account(ctx.name, schedule_startup=True)
     accounts = [ctx.name for ctx in contexts]
     account_infos = [_chat_account_context_public(ctx) for ctx in contexts]
     switchable_accounts = [ctx.name for ctx in contexts if bool(getattr(ctx, "keys_ready", False))]
@@ -4523,6 +4532,10 @@ def delete_chat_account(account: str):
         pass
     account_dirs_to_remove = list(dict.fromkeys(account_dirs_to_remove))
 
+    from ..ai.service import get_ai_service
+    for cleanup_name in cleanup_account_names:
+        get_ai_service().purge_account(cleanup_name)
+
     # Best-effort: close realtime connections first, otherwise Windows may keep db files locked.
     for cleanup_name in cleanup_account_names:
         try:
@@ -4858,7 +4871,36 @@ def list_chat_sessions(
         if username:
             usernames.append(username)
 
+    enterprise_groups: set[str] = set()
+    group_usernames = [u for u in usernames if u.endswith("@chatroom")]
+    if group_usernames:
+        quoted_groups = ",".join("'" + u.replace("'", "''") + "'" for u in group_usernames)
+        # chat_room_status_ bit 17 marks WeCom interoperability groups.
+        group_sql = (
+            "SELECT username_ AS username FROM chat_room_info_detail "
+            "WHERE (chat_room_status_ & 131072) != 0 "
+            f"AND username_ IN ({quoted_groups})"
+        )
+        try:
+            group_rows = []
+            if rt_conn is not None:
+                with rt_conn.lock:
+                    group_rows = _wcdb_exec_query(rt_conn.handle, kind="contact", path=None, sql=group_sql)
+            elif contact_db_path.exists():
+                group_conn = sqlite3.connect(str(contact_db_path))
+                group_conn.row_factory = sqlite3.Row
+                try:
+                    group_rows = group_conn.execute(group_sql).fetchall()
+                finally:
+                    group_conn.close()
+            enterprise_groups = {
+                str(_session_row_get(row, "username", "") or "") for row in group_rows
+            }
+        except Exception as exc:
+            logger.warning("[sessions] failed to read enterprise group flags: %s", exc)
+
     contact_rows = _load_contact_rows(contact_db_path, usernames)
+    enterprise_contacts = _load_enterprise_contact_info(contact_db_path, usernames, rt_conn=rt_conn)
     local_avatar_usernames = _query_head_image_usernames(head_image_db_path, usernames)
     trace(
         "contacts:loaded",
@@ -5125,6 +5167,8 @@ def list_chat_sessions(
                 "lastMessageTime": last_time,
                 "unreadCount": int(r["unread_count"] or 0),
                 "isGroup": bool(username.endswith("@chatroom")),
+                "isEnterpriseGroup": username in enterprise_groups,
+                "enterpriseName": enterprise_contacts.get(username, {}).get("enterpriseName", ""),
                 "isTop": bool(top_flags.get(str(username or "").strip(), False)),
             }
         )
@@ -5980,82 +6024,74 @@ def get_chat_message_daily_counts(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid year or month.")
 
-    account_dir = _resolve_account_dir(account)
-    source_requested = _normalize_chat_source(source)
-    source_norm, rt_conn, rt_error = _connect_realtime_for_chat_source(
-        account_dir=account_dir,
-        source_requested=source_requested,
-    )
-
-    if source_norm == "realtime":
-        rows, scan_limited, scanned = _fetch_realtime_message_rows(
-            rt_conn=rt_conn,
-            username=username,
-            max_scan=200000,
-            stop_before_ts=int(start_ts),
+    _, log_perf = create_perf_trace(logger, "chat.daily_counts", account=account, year=y, month=m)
+    metrics: dict[str, Any] = {"stage": "connect", "lockWaitMs": 0.0, "discoveryMs": 0.0, "aggregateMs": 0.0}
+    log_perf("request:start")
+    try:
+        account_dir = _resolve_account_dir(account)
+        source_requested = _normalize_chat_source(source)
+        source_norm, rt_conn, rt_error = _connect_realtime_for_chat_source(
+            account_dir=account_dir,
+            source_requested=source_requested,
         )
+        log_perf("source:resolved", source=source_norm)
         counts: dict[str, int] = {}
-        for row in rows:
-            try:
-                create_time = int(row.get("create_time") or 0)
-            except Exception:
-                create_time = 0
-            if create_time < int(start_ts) or create_time >= int(end_ts):
-                continue
-            day = datetime.fromtimestamp(create_time).strftime("%Y-%m-%d")
-            counts[day] = int(counts.get(day, 0)) + 1
-
-        total = int(sum(int(v) for v in counts.values())) if counts else 0
-        max_count = int(max(counts.values())) if counts else 0
-        return {
-            "status": "success",
-            "account": account_dir.name,
-            "username": username,
-            "source": "realtime",
-            "year": int(y),
-            "month": int(m),
-            "counts": counts,
-            "total": total,
-            "max": max_count,
-            "scanLimited": bool(scan_limited),
-            "scannedMessages": int(scanned),
-        }
-
-    db_paths = _iter_message_db_paths(account_dir)
-
-    counts: dict[str, int] = {}
-
-    for db_path in db_paths:
-        conn = sqlite3.connect(str(db_path))
-        try:
-            try:
-                table_name = _resolve_msg_table_name(conn, username)
-                if not table_name:
-                    continue
-                quoted_table = _quote_ident(table_name)
-                rows = conn.execute(
-                    "SELECT strftime('%Y-%m-%d', CAST(create_time AS INTEGER), 'unixepoch', 'localtime') AS day, "
-                    "COUNT(*) AS c "
-                    f"FROM {quoted_table} "
-                    "WHERE CAST(create_time AS INTEGER) >= ? AND CAST(create_time AS INTEGER) < ? "
-                    "GROUP BY day",
-                    (int(start_ts), int(end_ts)),
-                ).fetchall()
-                for day, c in rows:
-                    k = str(day or "").strip()
-                    if not k:
-                        continue
+        if source_norm == "realtime":
+            counts = _shared_fetch_realtime_daily_counts_via_exec(
+                rt_conn=rt_conn, username=username,
+                db_storage_dir=_resolve_account_db_storage_dir(account_dir),
+                exec_query=_wcdb_exec_query, start_time=start_ts, end_time=end_ts,
+                timings=metrics,
+            )
+        else:
+            metrics["stage"] = "discovery"
+            discovery_started = time.perf_counter()
+            db_paths = _iter_message_db_paths(account_dir)
+            metrics["discoveryMs"] += (time.perf_counter() - discovery_started) * 1000
+            metrics["candidateDatabases"] = len(db_paths)
+            for db_path in db_paths:
+                metrics["stage"] = "discovery"
+                discovery_started = time.perf_counter()
+                # 只读打开，分库丢失时不能创建空库并返回错误的零计数。
+                conn = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
+                try:
                     try:
-                        vv = int(c or 0)
-                    except Exception:
-                        vv = 0
-                    if vv <= 0:
-                        continue
-                    counts[k] = int(counts.get(k, 0)) + vv
-            except Exception:
-                continue
-        finally:
-            conn.close()
+                        table_name = _resolve_msg_table_name(conn, username)
+                        if not table_name:
+                            continue
+                        quoted_table = _quote_ident(table_name)
+                        columns = conn.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+                        time_type = next((str(col[2]).upper() for col in columns if str(col[1]).lower() == "create_time"), "")
+                        time_expr = "create_time" if "INT" in time_type else "CAST(create_time AS INTEGER)"
+                    finally:
+                        metrics["discoveryMs"] += (time.perf_counter() - discovery_started) * 1000
+                    metrics["stage"] = "aggregate"
+                    aggregate_started = time.perf_counter()
+                    try:
+                        rows = conn.execute(
+                            f"SELECT strftime('%Y-%m-%d', {time_expr}, 'unixepoch', 'localtime') AS day, "
+                            f"COUNT(*) AS c FROM {quoted_table} "
+                            f"WHERE {time_expr} >= ? AND {time_expr} < ? GROUP BY day",
+                            (int(start_ts), int(end_ts)),
+                        ).fetchall()
+                        metrics["returnedRows"] = metrics.get("returnedRows", 0) + len(rows)
+                        for day, count in rows:
+                            if not day or int(count) <= 0:
+                                raise ValueError("Invalid daily count")
+                            counts[str(day)] = counts.get(str(day), 0) + int(count)
+                    finally:
+                        metrics["aggregateMs"] += (time.perf_counter() - aggregate_started) * 1000
+                finally:
+                    conn.close()
+        metrics["stage"] = "complete"
+        log_perf("response:ready", **metrics, source=source_norm, activeDays=len(counts))
+    except HTTPException:
+        log_perf("request:failed", **metrics)
+        raise
+    except Exception as exc:
+        # 不记录原生异常文本，避免底层查询内容进入日历日志。
+        log_perf("request:failed", **metrics, errorType=type(exc).__name__)
+        raise HTTPException(status_code=503, detail="无法完整加载日历，请稍后重试") from exc
 
     total = int(sum(int(v) for v in counts.values())) if counts else 0
     max_count = int(max(counts.values())) if counts else 0
@@ -6065,6 +6101,7 @@ def get_chat_message_daily_counts(
         "account": account_dir.name,
         "username": username,
         "source": source_norm,
+        **({"scanLimited": False, "scannedMessages": 0} if source_norm == "realtime" else {}),
         **_chat_source_fallback_meta(
             account_dir=account_dir,
             requested_source=source_requested,
@@ -7341,6 +7378,10 @@ def list_chat_messages(
         groupNicknameCount=len(group_nicknames),
     )
 
+    enterprise_contacts = _load_enterprise_contact_info(
+        contact_db_path, sender_usernames_in_page,
+        rt_conn=rt_conn if source_norm == "realtime" else None,
+    )
     for m in messages_window:
         # If appmsg doesn't provide sourcedisplayname, try mapping sourceusername to display name.
         if (not str(m.get("from") or "").strip()) and str(m.get("fromUsername") or "").strip():
@@ -7355,6 +7396,7 @@ def list_chat_messages(
 
         su = str(m.get("senderUsername") or "")
         if su:
+            m["senderEnterpriseName"] = enterprise_contacts.get(su, {}).get("enterpriseName", "")
             m["senderDisplayName"] = _resolve_sender_display_name(
                 sender_username=su,
                 sender_contact_rows=sender_contact_rows,
@@ -8254,8 +8296,19 @@ async def search_chat_messages(
     session_limit: int = 200,
     per_chat_scan: int = 200,
     scan_limit: int = 20000,
+    retrieval_mode: str = 'keyword',
+    search_ticket: Optional[str] = None,
 ):
     source_requested = _normalize_chat_source(source)
+
+    if retrieval_mode not in {'keyword', 'hybrid'}:
+        raise HTTPException(400, '不支持的检索方式')
+    requested_hybrid = retrieval_mode == 'hybrid'
+    if requested_hybrid:
+        from ..local_search.service import get_local_search
+        local_config = get_local_search().config(_resolve_account_dir(account).name)
+        if not local_config['enabled'] or not local_config.get('active'):
+            retrieval_mode = 'keyword'
 
     response = await _search_chat_messages_via_fts(
         request,
@@ -8264,8 +8317,8 @@ async def search_chat_messages(
         username=username,
         sender=sender,
         session_type=session_type,
-        limit=limit,
-        offset=offset,
+        limit=200 if retrieval_mode == 'hybrid' else limit,
+        offset=0 if retrieval_mode == 'hybrid' else offset,
         start_time=start_time,
         end_time=end_time,
         render_types=render_types,
@@ -8285,6 +8338,28 @@ async def search_chat_messages(
                     "message": "Chat search index is built from the local decrypted SQLite snapshot.",
                 },
             )
+    if retrieval_mode == 'hybrid':
+        from ..local_search.service import get_local_search
+        from ..chat_export_service import get_chat_export_targets_preview
+        account_id = _resolve_account_dir(account).name
+        targets = await asyncio.to_thread(get_chat_export_targets_preview, account=account_id,
+            include_hidden=include_hidden, include_official=include_official)
+        usernames = [x['username'] for x in targets['targets'] if not username or x['username'] == username]
+        if session_type == 'group': usernames = [u for u in usernames if u.endswith('@chatroom')]
+        elif session_type == 'single': usernames = [u for u in usernames if not u.endswith('@chatroom')]
+        combined = await get_local_search().hybrid(account_id, response, q, usernames, start_time, end_time,
+            sender, render_types.split(',') if render_types else None, offset, limit, search_ticket)
+        if combined.get('retrievalMode') == 'keyword':
+            # 降级后恢复原关键词分页，不能在仅有 200 条的召回窗口中继续切片。
+            fallback = await _search_chat_messages_via_fts(request, q=q, account=account, username=username,
+                sender=sender, session_type=session_type, limit=limit, offset=offset,
+                start_time=start_time, end_time=end_time, render_types=render_types,
+                include_hidden=include_hidden, include_official=include_official,
+                source=source_requested, allow_native_enrichment=allow_native_enrichment)
+            combined = {**fallback, 'retrievalMode': 'keyword', 'coverage': combined['coverage']}
+        return combined
+    if requested_hybrid and isinstance(response,dict):
+        response = {**response, 'retrievalMode':'keyword','coverage':{'message':'本地语义检索尚未就绪，当前展示关键词结果'}}
     return response
 
 
@@ -8457,6 +8532,7 @@ async def get_chat_messages_around(
                 base_url=base_url,
                 contact_db_path=contact_db_path,
                 head_image_db_path=head_image_db_path,
+                rt_conn=rt_conn,
             )
 
             anchor_id_canon = f"{rt_db_path.stem}:{rt_table_name}:{int(anchor_local_id)}"

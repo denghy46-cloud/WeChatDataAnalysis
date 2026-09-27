@@ -4,7 +4,8 @@
     class="settings-dialog theme-scope fixed inset-0 z-[20000] flex items-center justify-center bg-black/40 px-2 py-2 backdrop-blur-md sm:px-4 sm:py-8"
     @click.self="handleClose"
   >
-    <div class="settings-dialog-panel flex h-[80vh] min-h-[380px] w-full max-w-[880px] overflow-hidden rounded-[10px] border border-[#e2e2e2] bg-white shadow-2xl">
+    <!-- 所有栏目共用尺寸，避免滚动更新当前栏目时弹窗跳动。 -->
+    <div class="settings-dialog-panel flex h-[88vh] min-h-[380px] w-full max-w-[1000px] overflow-hidden rounded-[10px] border border-[#e2e2e2] bg-white shadow-2xl">
       <!-- Sidebar -->
       <aside class="hidden w-[160px] shrink-0 flex-col bg-[#fcfcfc] border-r border-[#eeeeee] sm:flex">
         <div class="mt-4 mb-2 flex items-center px-4 gap-2">
@@ -23,10 +24,10 @@
             :key="item.key"
             type="button"
             class="group flex w-full flex-col items-start rounded-[6px] px-3 py-1.5 text-left transition select-none"
-            :class="activeSection === item.key ? 'bg-white shadow-sm ring-1 ring-[#e5e5e5]' : 'hover:bg-[#f0f0f0]/60'"
+            :class="activeSection === item.key ? 'bg-[var(--app-accent)]' : 'hover:bg-[#f0f0f0]/60'"
             @click="scrollToSection(item.key)"
           >
-            <div class="text-[12px] font-medium" :class="activeSection === item.key ? 'text-[#111]' : 'text-[#777] group-hover:text-[#333]'">
+            <div class="text-[12px] font-medium" :class="activeSection === item.key ? 'text-white' : 'text-[#777] group-hover:text-[#333]'">
               {{ item.label }}
             </div>
           </button>
@@ -251,6 +252,10 @@
             </div>
           </section>
 
+          <section ref="aiSectionRef">
+            <AiSettings v-if="open" />
+          </section>
+
           <section ref="voiceSectionRef">
             <div class="mb-2.5 text-[12px] font-bold tracking-widest text-[var(--app-text-muted)]">语音转文字</div>
             <div class="divide-y divide-[var(--app-border-soft)] overflow-hidden rounded-[10px] border border-[var(--app-border)] bg-[var(--app-surface-bg)]">
@@ -258,7 +263,7 @@
                 <div class="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
                   <div class="min-w-0 flex-1">
                     <div class="text-[13px] font-medium text-[var(--app-text-primary)]">推理设备</div>
-                    <div class="mt-0.5 text-[11px] leading-relaxed text-[var(--app-text-muted)]">CPU 兼容所有设备；NVIDIA GPU 使用 CUDA 加速，初始化失败会自动回退 CPU。</div>
+                    <div class="mt-0.5 text-[11px] leading-relaxed text-[var(--app-text-muted)]">选择新模型时会匹配所需设备。Whisper 支持 GPU 失败后回退 CPU；Qwen GPU 不会自动切换模型。</div>
                   </div>
                   <div class="flex w-full shrink-0 overflow-hidden rounded-[6px] border border-[var(--app-border)] bg-[var(--app-surface-bg)] sm:w-auto" role="radiogroup" aria-label="语音转文字推理设备">
                     <button
@@ -267,7 +272,8 @@
                       :aria-checked="voiceDevicePreference === 'cpu'"
                       class="voice-setting-focus flex-1 px-2.5 py-1.5 text-[12px] transition disabled:cursor-not-allowed disabled:opacity-50 sm:flex-none"
                       :class="voiceDevicePreference === 'cpu' ? 'bg-[var(--app-surface-muted)] text-[var(--app-accent)]' : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-neutral-btn-hover)]'"
-                      :disabled="voiceDeviceBusy || voiceDeviceLocked"
+                      :disabled="voiceDeviceBusy || voiceDeviceLocked || !voiceSupportedDevices.includes('cpu')"
+                      :title="voiceSupportedDevices.includes('cpu') ? '使用 CPU 识别' : '当前模型需要 GPU，请先选择 CPU 模型'"
                       @click="setVoiceDevice('cpu')"
                     >
                       CPU
@@ -278,8 +284,8 @@
                       :aria-checked="voiceDevicePreference === 'cuda'"
                       class="voice-setting-focus flex-1 border-l border-[var(--app-border)] px-2.5 py-1.5 text-[12px] transition disabled:cursor-not-allowed disabled:opacity-50 sm:flex-none"
                       :class="voiceDevicePreference === 'cuda' ? 'bg-[var(--app-surface-muted)] text-[var(--app-accent)]' : 'text-[var(--app-text-secondary)] hover:bg-[var(--app-neutral-btn-hover)]'"
-                      :disabled="voiceDeviceBusy || voiceDeviceLocked || !voiceCudaAvailable"
-                      :title="voiceCudaAvailable ? '使用 NVIDIA CUDA 加速' : (voiceCudaReason || '未检测到可用的 NVIDIA CUDA 设备')"
+                      :disabled="voiceDeviceBusy || voiceDeviceLocked || !voiceCudaAvailable || !voiceSupportedDevices.includes('cuda')"
+                      :title="!voiceSupportedDevices.includes('cuda') ? '当前模型仅使用 CPU，请先选择 GPU 模型' : voiceCudaAvailable ? '使用 NVIDIA CUDA 加速' : (voiceCudaReason || '未检测到可用的 NVIDIA CUDA 设备')"
                       @click="setVoiceDevice('cuda')"
                     >
                       NVIDIA GPU
@@ -287,7 +293,7 @@
                   </div>
                 </div>
 
-                <div v-if="voiceStatusLoading" class="mt-2 text-[11px] text-[var(--app-text-muted)]">正在检测本地 Whisper 与 CUDA 状态...</div>
+                <div v-if="voiceStatusLoading" class="mt-2 text-[11px] text-[var(--app-text-muted)]">正在检测语音模型与运行环境...</div>
                 <template v-else>
                   <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-[var(--app-text-secondary)]">
                     <span>已选：{{ voiceDeviceLabel }}</span>
@@ -306,8 +312,8 @@
               <div class="px-3.5 py-3">
                 <div class="flex flex-wrap items-start justify-between gap-2">
                   <div class="min-w-0 flex-1">
-                    <div class="text-[13px] font-medium text-[var(--app-text-primary)]">Whisper 模型</div>
-                    <div class="mt-0.5 text-[11px] leading-relaxed text-[var(--app-text-muted)]">模型需先下载到本机，再选择用于后续语音识别；本应用下载的模型可随时删除。</div>
+                    <div class="text-[13px] font-medium text-[var(--app-text-primary)]">语音识别模型</div>
+                    <div class="mt-0.5 text-[11px] leading-relaxed text-[var(--app-text-muted)]">低配电脑选 CTC；无独显选 Qwen CPU；有 NVIDIA 显卡可选 Turbo 或 Qwen GPU。下载并选择模型后，语音在本机处理。</div>
                   </div>
                   <span class="shrink-0 rounded-full bg-[var(--app-surface-muted)] px-2 py-1 text-[10px] text-[var(--app-text-secondary)]">当前：{{ voiceModelText }}</span>
                 </div>
@@ -315,7 +321,7 @@
                 <div v-if="voiceStatusLoading" class="mt-3 grid gap-2 sm:grid-cols-2" aria-label="正在读取模型列表">
                   <div v-for="index in 4" :key="index" class="h-[134px] rounded-[9px] bg-[var(--app-surface-muted)]" />
                 </div>
-                <div v-else-if="voiceModels.length" class="mt-3 grid gap-2.5 sm:grid-cols-2" role="list" aria-label="可用 Whisper 模型">
+                <div v-else-if="voiceModels.length" id="voice-model-list" class="mt-3 grid gap-2.5 sm:grid-cols-2" role="list" aria-label="可用语音识别模型">
                   <article
                     v-for="model in voiceModels"
                     :key="model.id"
@@ -337,6 +343,7 @@
                     </div>
 
                     <div class="mt-1.5 line-clamp-2 text-[10px] leading-relaxed text-[var(--app-text-secondary)]">{{ model.description }}</div>
+                    <div v-if="!model.runtimeAvailable" class="mt-1.5 text-[11px] leading-relaxed text-[var(--app-text-secondary)]">{{ model.runtimeReason }}</div>
                     <div v-if="isVoiceModelDownloading(model)" class="mt-2" data-voice-model-progress>
                       <div class="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[10px] leading-relaxed">
                         <span class="text-[var(--app-text-secondary)]">{{ voiceModelDownloadStageText(model) }}</span>
@@ -366,8 +373,8 @@
                         v-if="model.downloaded && !model.selected"
                         type="button"
                         class="voice-setting-focus rounded-[5px] border border-[var(--app-border)] bg-[var(--app-surface-bg)] px-2 py-1 text-[10px] font-medium text-[var(--app-accent)] transition hover:bg-[var(--app-neutral-btn-hover)] disabled:cursor-not-allowed disabled:opacity-50"
-                        :disabled="voiceModelLocked || isVoiceModelActionBusy(model.id)"
-                        :title="voiceModelLocked ? '模型由启动环境变量固定' : `选择 ${model.name}`"
+                        :disabled="voiceModelLocked || !model.runtimeAvailable || isVoiceModelActionBusy(model.id)"
+                        :title="voiceModelLocked ? '模型由启动环境变量固定' : !model.runtimeAvailable ? model.runtimeReason : `选择 ${model.name}`"
                         @click="selectVoiceModel(model)"
                       >
                         {{ isVoiceModelActionBusy(model.id, 'select') ? '选择中...' : '选择' }}
@@ -398,6 +405,7 @@
                 <div v-else-if="!voiceDeviceError" class="mt-3 rounded-[8px] bg-[var(--app-surface-soft)] px-3 py-4 text-center text-[11px] text-[var(--app-text-muted)]">后端未返回可用模型列表。</div>
 
                 <div v-if="voiceModelLocked" class="mt-2 text-[11px] leading-relaxed text-[var(--app-text-secondary)]">模型由 WECHAT_TOOL_WHISPER_MODEL 环境变量固定，界面中不可切换。</div>
+                <div v-if="voiceModelMigrationMessage" role="status" class="mt-2 text-[11px] leading-relaxed text-[var(--app-text-secondary)]">{{ voiceModelMigrationMessage }}</div>
                 <div v-if="voiceStatusReason" class="mt-2 text-[11px] leading-relaxed text-[var(--app-text-muted)]">{{ voiceStatusReason }}</div>
                 <div v-if="voiceModelMessage" class="mt-2 text-[11px] text-[var(--app-accent)]">{{ voiceModelMessage }}</div>
                 <ErrorNotice v-if="voiceModelError" :message="voiceModelError" compact manual class="mt-1.5 text-[11px] text-[var(--danger-color)]" />
@@ -408,7 +416,7 @@
                   <div class="min-w-0 flex-1">
                     <div class="text-[13px] font-medium text-[var(--app-text-primary)]">本项目转写数据</div>
                     <div class="mt-0.5 text-[11px] leading-relaxed text-[var(--app-text-muted)]">
-                      删除所有账号中由本项目 Whisper 生成的转写文字。微信原生转写、原始语音和模型都会保留。
+                      删除所有账号中由本项目本地模型生成的转写文字。微信原生转写、原始语音和模型都会保留。
                     </div>
                   </div>
                   <button
@@ -625,7 +633,7 @@
                 <div class="flex items-center justify-between gap-3">
                   <div class="min-w-0 flex-1">
                     <div class="text-[13px] font-medium text-[#222]">自动获取原图</div>
-                    <div class="mt-0.5 text-[11px] text-[#909090]">本地缺原图时自动联网拉取原图（每账号每天最多 {{ cdnImageDailyLimit }} 张）。关闭后仅显示本地已有图片。</div>
+                    <div class="mt-0.5 text-[11px] text-[#909090]">本地缺原图时自动联网拉取原图，按套餐额度计费。关闭后仅显示本地已有图片。</div>
                   </div>
                   <button
                     type="button"
@@ -636,6 +644,21 @@
                     @click="toggleCdnImage"
                   >
                     <span class="settings-switch-thumb" :class="cdnImageEnabled ? 'translate-x-[20px]' : 'translate-x-0'" />
+                  </button>
+                </div>
+              </div>
+              <div class="px-3.5 py-3">
+                <div class="flex items-center justify-between gap-3">
+                  <div class="min-w-0 flex-1">
+                    <div class="text-[13px] font-medium text-[#222]">套餐与额度</div>
+                    <div class="mt-0.5 text-[11px] text-[#909090]">查看当前版本、剩余额度与重置时间，输入兑换码激活。</div>
+                  </div>
+                  <button
+                    type="button"
+                    class="shrink-0 rounded-[6px] border border-[#e2e2e2] bg-[#fafafa] px-2.5 py-1 text-[12px] text-[#222] transition hover:bg-[#f0f0f0]"
+                    @click="openPlanWindow('manual')"
+                  >
+                    打开套餐
                   </button>
                 </div>
               </div>
@@ -750,9 +773,11 @@ const props = defineProps({
 
 const emit = defineEmits(['close'])
 const api = useApi()
+const { openPlanWindow } = usePlanWindow()
 
 const settingNavItems = [
   { key: 'desktop', label: '桌面行为', hint: '启动 / 关闭 / 端口' },
+  { key: 'ai', label: 'AI 服务', hint: '模型 / 密钥 / 默认能力' },
   { key: 'voice', label: '语音转文字', hint: 'CPU / NVIDIA GPU' },
   { key: 'mcp', label: 'MCP 接入', hint: '局域网 / Skill / 工具' },
   { key: 'keys', label: '数据库与密钥', hint: '密钥查看 / 复制' },
@@ -767,6 +792,7 @@ const contentScrollRef = ref(null)
 const desktopSectionRef = ref(null)
 const desktopLogFileRef = ref(null)
 const voiceSectionRef = ref(null)
+const aiSectionRef = ref(null)
 const mcpSectionRef = ref(null)
 const keysSectionRef = ref(null)
 const startupSectionRef = ref(null)
@@ -783,7 +809,7 @@ const desktopVersionText = computed(() => {
   return v || '—'
 })
 
-const desktopDefaultToChatWhenData = ref(false)
+const desktopDefaultToChatWhenData = ref(true)
 
 const wechatUpdateGuard = ref({
   supported: false,
@@ -813,7 +839,6 @@ const wechatUpdateGuardDescription = computed(() => {
 
 const cdnImageEnabled = ref(false)
 const cdnImageLoading = ref(false)
-const cdnImageDailyLimit = ref(10)
 const snsUseCache = ref(true)
 
 const desktopAutoLaunch = ref(false)
@@ -959,13 +984,15 @@ const voiceDeviceError = ref('')
 const voiceDevicePreference = ref('cpu')
 const voiceDeviceSource = ref('default')
 const voiceActiveDevice = ref('')
-const voiceModel = ref('medium')
+const voiceModel = ref('zipformer-small-ctc-int8')
 const voiceModels = ref([])
+const voiceSupportedDevices = ref(['cpu', 'cuda'])
 const voiceModelSource = ref('default')
 const voiceModelAction = ref({ id: '', type: '' })
 const voiceModelDeletePendingIds = ref([])
 const voiceModelError = ref('')
 const voiceModelMessage = ref('')
+const voiceModelMigrationMessage = ref('')
 const voiceTranscriptDeleteBusy = ref(false)
 const voiceTranscriptDeleteError = ref('')
 const voiceTranscriptDeleteMessage = ref('')
@@ -980,7 +1007,7 @@ const voiceDeviceLocked = computed(() => voiceDeviceSource.value === 'env')
 const voiceModelLocked = computed(() => voiceModelSource.value === 'env')
 const voiceCudaAvailable = computed(() => !!voiceCuda.value?.available)
 const voiceCudaReason = computed(() => String(voiceCuda.value?.reason || '').trim())
-const voiceModelText = computed(() => String(voiceModel.value || 'medium').trim() || 'medium')
+const voiceModelText = computed(() => voiceModels.value.find(model => model.id === voiceModel.value)?.name || voiceModel.value || 'zipformer-small-ctc-int8')
 const voiceDeviceLabel = computed(() => voiceDevicePreference.value === 'cuda' ? 'NVIDIA GPU' : 'CPU')
 const voiceCudaDeviceLabels = computed(() => {
   const devices = Array.isArray(voiceCuda.value?.devices) ? voiceCuda.value.devices : []
@@ -1104,6 +1131,7 @@ const refreshDesktopOutputDirProgress = async () => {
 
 const sectionElements = computed(() => [
   { key: 'desktop', el: desktopSectionRef.value },
+  { key: 'ai', el: aiSectionRef.value },
   { key: 'voice', el: voiceSectionRef.value },
   { key: 'mcp', el: mcpSectionRef.value },
   { key: 'keys', el: keysSectionRef.value },
@@ -1118,20 +1146,32 @@ const scrollToSection = (key) => {
   const target = sectionElements.value.find((item) => item.key === key)?.el
   activeSection.value = key
   if (!scrollHost || !target) return
+  // offsetTop 相对定位祖先计算，会把设置页固定标题栏的高度重复计入。
+  const targetTop = scrollHost.scrollTop + target.getBoundingClientRect().top - scrollHost.getBoundingClientRect().top
   scrollHost.scrollTo({
-    top: Math.max(0, target.offsetTop - 10),
+    top: Math.max(0, targetTop - 10),
     behavior: 'smooth',
   })
 }
 
 const scrollToFocusTarget = async () => {
   const focusTarget = String(props.focusTarget || '').trim()
+  if (focusTarget === 'ai' || focusTarget === 'local-search') {
+    await nextTick()
+    scrollToSection('ai')
+    return
+  }
   if (focusTarget === 'voice') {
     await nextTick()
     scrollToSection('voice')
     return
   }
-  if (focusTarget !== 'log-file') return
+  if (focusTarget !== 'log-file') {
+    // 弹窗重新挂载后滚动区回到顶部，同步栏目标题，避免沿用上次高亮。
+    await nextTick()
+    onContentScroll()
+    return
+  }
   await nextTick()
   activeSection.value = 'desktop'
   const scrollHost = contentScrollRef.value
@@ -1160,10 +1200,11 @@ const onContentScroll = () => {
     }
   }
   const position = scrollHost.scrollTop + 120
+  const hostTop = scrollHost.getBoundingClientRect().top
   let current = settingNavItems[0].key
   for (const section of sectionElements.value) {
     if (!section.el) continue
-    if (section.el.offsetTop <= position) current = section.key
+    if (scrollHost.scrollTop + section.el.getBoundingClientRect().top - hostTop <= position) current = section.key
   }
   activeSection.value = current
 }
@@ -1254,7 +1295,9 @@ const applyVoiceTranscriptionStatus = (status) => {
   voiceDevicePreference.value = requestedDevice === 'cuda' ? 'cuda' : 'cpu'
   voiceDeviceSource.value = String(status.deviceSource || 'default').trim() || 'default'
   voiceActiveDevice.value = String(status.activeDevice || '').trim().toLowerCase()
-  voiceModel.value = String(status.model || 'medium').trim() || 'medium'
+  voiceSupportedDevices.value = Array.isArray(status.supportedDevices) ? status.supportedDevices : ['cpu', 'cuda']
+  voiceModelMigrationMessage.value = String(status.modelMigrationMessage || '')
+  voiceModel.value = String(status.model || 'zipformer-small-ctc-int8').trim() || 'zipformer-small-ctc-int8'
   voiceModelSource.value = String(status.modelSettingSource || 'default').trim() || 'default'
   voiceModels.value = (Array.isArray(status.models) ? status.models : []).map((item) => {
     const id = String(item?.id || '').trim()
@@ -1274,6 +1317,8 @@ const applyVoiceTranscriptionStatus = (status) => {
       quality: String(item?.quality || '质量未知').trim(),
       description: String(item?.description || '').trim(),
       recommended: item?.recommended === true,
+      runtimeAvailable: item?.runtimeAvailable !== false,
+      runtimeReason: String(item?.runtimeReason || '缺少运行组件，请更新应用或选择其他模型。'),
       selected: item?.selected === true || id === voiceModel.value,
       downloaded,
       downloadable: item?.downloadable !== false,
@@ -1467,7 +1512,7 @@ const startVoiceModelDownload = async (model) => {
 }
 
 const selectVoiceModel = async (model) => {
-  if (!model?.id || !model.downloaded || model.selected || voiceModelLocked.value || isVoiceModelActionBusy(model.id)) return
+  if (!model?.id || !model.downloaded || !model.runtimeAvailable || model.selected || voiceModelLocked.value || isVoiceModelActionBusy(model.id)) return
   const generation = voiceModelDownloadGeneration(model.id)
   voiceModelAction.value = { id: model.id, type: 'select' }
   voiceModelError.value = ''
@@ -1545,7 +1590,7 @@ const voiceTranscriptDeleteErrorMessage = (error) => {
 
 const deleteAllProjectVoiceTranscripts = async () => {
   if (voiceTranscriptDeleteBusy.value) return
-  const confirmation = '此操作不可撤销：将删除所有账号中由本项目 Whisper 生成的全部转写文字。微信原生转写、原始语音和已下载模型都会保留。确定继续吗？'
+  const confirmation = '此操作不可撤销：将删除所有账号中由本项目本地模型生成的全部转写文字。微信原生转写、原始语音和已下载模型都会保留。确定继续吗？'
   if (!window.confirm(confirmation)) return
 
   voiceTranscriptDeleteBusy.value = true
@@ -2125,8 +2170,6 @@ const loadCdnImageStatus = async () => {
   try {
     const res = await api.getCdnImageStatus()
     cdnImageEnabled.value = res?.enabled === true
-    const limit = Number(res?.dailyLimit)
-    if (Number.isFinite(limit) && limit > 0) cdnImageDailyLimit.value = limit
   } catch {
     // 读取失败保持默认关闭
   }
@@ -2252,7 +2295,7 @@ onMounted(async () => {
     }
   }
 
-  desktopDefaultToChatWhenData.value = readLocalBoolSetting(DESKTOP_SETTING_DEFAULT_TO_CHAT_KEY, false)
+  desktopDefaultToChatWhenData.value = readLocalBoolSetting(DESKTOP_SETTING_DEFAULT_TO_CHAT_KEY, true)
   snsUseCache.value = readLocalBoolSetting(SNS_SETTING_USE_CACHE_KEY, true)
   void loadCdnImageStatus()
 

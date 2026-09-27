@@ -12,10 +12,12 @@ wheels/
 /output/
 /.native-core-cache-v1/
 /.native-core-license-v1/
-/.playwright-cli/
+.playwright-cli/
 /.pnpm-store/
 /.pytest-tmp-*/
 /.testdeps/
+/private/
+/work/
 /.idea
 /.history/
 /.augment/
@@ -24,6 +26,8 @@ wheels/
 # Local config templates
 /wechat_db_config_template.json
 /wechat_db_config.json
+# WxCDN 运行期状态（按 wxid 存 token / 额度 / 最近下载），只属于本机
+/cdn_account_state.json
 .ace-tool/
 pnpm-lock.yaml
 /tools/tmp_isaac64_compare.js
@@ -63,6 +67,19 @@ pnpm-lock.yaml
 /desktop/resources/signing/*
 !/desktop/resources/signing/.gitkeep
 /desktop/resources/icon.ico
+/desktop/.operation-auth-*/
+
+# Local dependency, diagnostic, and scratch artifacts
+/node_modules/
+/logs/
+/WeQ/
+*.obj
+/cdn_image_quota.json
+/agreement-ready.yml
+/app-home.yml
+/chat-home.yml
+/group-before.yml
+/nul`r`ncl.exe
 
 # Native-core developer artifacts are supplied by the producer workflow.
 # Source mode downloads and verifies these native-core files into the per-user
@@ -94,3 +111,24 @@ pnpm-lock.yaml
 
 # Local runtime state managed by wcda-menu.sh
 /.wcda-runtime/
+/tmp/local-search-validation/
+
+# 本地跨平台验收的传输包、运行目录与远程连接辅助脚本
+/tmp/macos-ai-*
+/tmp/macos-public-manifest.json
+/tmp/mac-desktop-probe.cjs
+/tmp/mac-ui-check.cjs
+/tmp/mac-user-ui.cjs
+/tmp/mac-e2e-private.json
+/tmp/ai-frozen-check/
+/tmp/ai-macos-regression-*/
+
+# 高级版演示走片的默认输出目录（website/dev/shot.mjs），只是本地调试产物
+pro-shots/
+
+# 隔离验收数据库、真实聊天资料和本地状态快照不得进入版本库。
+/tmp/deepagents-migration/
+
+# 语音验收包含真实聊天音频、转写、模型权重及本地运行环境。
+/tmp/stt-benchmark-20260921/
+/tmp/stt-integration-20260921/

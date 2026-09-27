@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import unquote_plus
@@ -44,6 +45,11 @@ _SECRET_LOG_KEYS = {
     "setcookie",
     "token",
     "xorkey",
+}
+_URL_QUERY_LOG_KEYS = {
+    "remoteurl",
+    "sourceurl",
+    "url",
 }
 
 
@@ -105,7 +111,11 @@ def redact_sensitive_query_text(value: Any) -> str:
             decoded_key = unquote_plus(raw_key)
         except Exception:
             decoded_key = raw_key
-        if separator and _is_sensitive_log_key(decoded_key):
+        normalized_key = _normalized_log_key(decoded_key)
+        if separator and (
+            _is_sensitive_log_key(decoded_key) or normalized_key in _URL_QUERY_LOG_KEYS
+            or normalized_key in {'q', 'query', 'keyword', 'keywords', 'question', 'prompt', 'content', 'text', 'condition'}
+        ):
             redacted_parts.append(f"{raw_key}=<redacted>")
         else:
             redacted_parts.append(part)
@@ -124,6 +134,36 @@ class SensitiveQueryLogFilter(logging.Filter):
             updated[2] = redact_sensitive_query_text(updated[2])
             record.args = tuple(updated)
         return True
+
+
+class SensitiveHttpClientLogFilter(logging.Filter):
+    """Drop dependency request logs that contain complete remote URLs.
+
+    SNS media diagnostics are emitted separately with host, size suffix, byte
+    counts, and hashed identities. The raw httpx/httpcore request records add no
+    actionable information and can expose credential-bound CDN URLs.
+    """
+
+    _wda_sensitive_http_client_filter = True
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        logger_name = str(record.name or "").lower()
+        diagnostics = sys.modules.get('wechat_decrypt_tool.ai.diagnostics')
+        if diagnostics and diagnostics.context.get().get('trace_id') and logger_name != diagnostics.logger.name and logger_name != 'uvicorn.access':
+            # AI 调用链内旧模块/依赖的自由文本不能越过统一白名单。
+            fields = diagnostics.safe_fields(diagnostics.context.get())
+            if record.exc_info and record.exc_info[1]:
+                fields.update(diagnostics.exception_fields(record.exc_info[1]))
+            record.msg = '[ai.dependency] 依赖诊断 ' + json.dumps(fields, ensure_ascii=False, separators=(',', ':'))
+            record.args, record.exc_info, record.exc_text, record.stack_info = (), None, None, None
+        return not (
+            logger_name.split('.')[0] in {'anthropic', 'openai', 'langchain', 'langchain_core', 'langchain_openai', 'langchain_anthropic', 'huggingface_hub'}
+            or
+            logger_name == "httpx"
+            or logger_name.startswith("httpx.")
+            or logger_name == "httpcore"
+            or logger_name.startswith("httpcore.")
+        )
 
 
 def _stringify_detail(detail: Any) -> str:
@@ -232,6 +272,9 @@ def _extract_response_detail_from_body(response: Response, body: bytes) -> str:
 async def log_server_errors_middleware(logger, request: Request, call_next):
     method = str(request.method or "").upper() or "GET"
     path = str(request.url.path or "").strip() or "/"
+    if path.startswith('/api/ai/') or request.headers.get('X-WCDA-AI-Trace'):
+        from .ai.diagnostics_http import diagnostic_request
+        return await diagnostic_request(request, call_next)
 
     try:
         response = await call_next(request)

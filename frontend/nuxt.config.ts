@@ -1,4 +1,7 @@
 // https://nuxt.com/docs/api/configuration/nuxt-config
+import { fileURLToPath } from 'node:url'
+import { searchForWorkspaceRoot } from 'vite'
+import tailwindcss from '@tailwindcss/vite'
 import {
   FIRST_USE_AGREEMENT_STORAGE_KEY,
   FIRST_USE_AGREEMENT_VERSION,
@@ -9,6 +12,8 @@ const frontendHost = String(process.env.NUXT_HOST || '').trim()
 const frontendPort = Number.parseInt(String(process.env.NUXT_PORT || process.env.PORT || '3000').trim(), 10)
 const backendPort = String(process.env.WECHAT_TOOL_PORT || '10392').trim() || '10392'
 const devProxyTarget = `http://127.0.0.1:${backendPort}/api`
+const frontendDir = fileURLToPath(new URL('.', import.meta.url))
+const websiteAssetsDir = fileURLToPath(new URL('../website/assets', import.meta.url))
 const firstUseBootstrapScript = createFirstUseBootstrapScript({
   storageKey: FIRST_USE_AGREEMENT_STORAGE_KEY,
   version: FIRST_USE_AGREEMENT_VERSION,
@@ -51,12 +56,28 @@ export default defineNuxtConfig({
     }
   },
   
+  // 「高级功能」弹窗复用官网的 pro-demos 演示引擎（website/assets 下），跨根导入需要别名，
+  // 并让 dev server 额外放行 website/assets（保留 Vite 默认推断的工作区根，不把整个仓库暴露给 /@fs/）
+  vite: {
+    plugins: [tailwindcss()],
+    resolve: {
+      alias: [{ find: '@website', replacement: websiteAssetsDir }]
+    },
+    server: {
+      fs: {
+        allow: [searchForWorkspaceRoot(frontendDir), websiteAssetsDir]
+      }
+    }
+  },
+
   // 应用配置
   css: [
+    '~/assets/css/tailwind.css',
     '@fortawesome/fontawesome-free/css/all.min.css',
     '~/assets/css/chat.css',
     '~/assets/css/record-pages.css',
-    '~/assets/css/export-panels.css'
+    '~/assets/css/export-panels.css',
+    '~/assets/css/wxcdn-card.css'
   ],
 
   // 应用配置
@@ -83,23 +104,13 @@ export default defineNuxtConfig({
   
   // 模块配置
   modules: [
-    '@nuxtjs/tailwindcss',
     '@pinia/nuxt'
   ],
 
   // 启用组件自动导入
   components: [
-    { path: '~/components', pathPrefix: false }
+    { path: '~/components', pathPrefix: false,
+      ignore: ['ai-elements/**'] }
   ],
   
-  // Tailwind配置
-  tailwindcss: {
-    cssPath: ['~/assets/css/tailwind.css', { injectPosition: "first" }],
-    configPath: 'tailwind.config',
-    exposeConfig: {
-      level: 2
-    },
-    config: {},
-    viewer: true
-  }
 })

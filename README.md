@@ -5,13 +5,12 @@
 <div align="center">
     <h1>WeChatDataAnalysis - 微信数据库解密与分析工具</h1>
     <p>微信4.x数据解密并生成年度总结，高仿微信，支持实时更新，导出聊天记录，朋友圈等大量便捷功能</p>
-    <p><b>特别致谢</b>：<a href="https://github.com/H3CoF6">H3CoF6</a>（密钥与朋友圈等核心内容的技术支持）、<a href="https://github.com/ycccccccy/echotrace">echotrace</a>、<a href="https://github.com/hicccc77/WeFlow">WeFlow</a>（本项目大量功能参考其实现）</p>
-    <p>如需定制功能，请联系 QQ：2977094657。</p>
+    <p>官网链接：https://lifearchiveproject.github.io/WeChatDataAnalysis/</p>
     <img src="https://img.shields.io/github/v/tag/LifeArchiveProject/WeChatDataAnalysis" alt="Version" />
     <img src="https://img.shields.io/github/stars/LifeArchiveProject/WeChatDataAnalysis" alt="Stars" />
     <img src="https://gh-down-badges.linkof.link/LifeArchiveProject/WeChatDataAnalysis" alt="Downloads" />
     <img src="https://img.shields.io/github/forks/LifeArchiveProject/WeChatDataAnalysis" alt="Forks" />
-    <a href="https://qm.qq.com/q/VQEQ7PcGkk"><img src="https://img.shields.io/badge/QQ Group-WeChatDataAnalysis-12B7F5?logo=tencentqq&logoColor=white" alt="QQ Group" /></a>
+    <a href="https://qm.qq.com/q/2IB0gvYpYA"><img src="https://img.shields.io/badge/QQ Group-WeChatDataAnalysis-12B7F5?logo=tencentqq&logoColor=white" alt="QQ Group" /></a>
     <img src="https://img.shields.io/badge/Python-3776AB?logo=Python&logoColor=white" alt="Python" />
     <img src="https://img.shields.io/badge/Vue.js-4FC08D?logo=Vue.js&logoColor=white" alt="Vue.js" />
     <img src="https://img.shields.io/badge/SQLite-003B57?logo=SQLite&logoColor=white" alt="SQLite" />
@@ -93,7 +92,49 @@
   <tr>
     <td colspan="2" align="center"><img src="frontend/public/Contact.png" alt="联系人导出" width="800"/></td>
   </tr>
+  <tr>
+    <td align="center" colspan="2"><b>微信收藏</b></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="frontend/public/readme-favorites.png" alt="微信收藏" width="800"/></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><b>转账与红包</b></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="frontend/public/readme-payments.png" alt="转账与红包" width="800"/></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><b>小程序</b></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="frontend/public/readme-mini-programs.png" alt="小程序" width="800"/></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><b>视频号直播</b></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="frontend/public/readme-finder.png" alt="视频号直播" width="800"/></td>
+  </tr>
 </table>
+
+## 高级版
+
+常规版聚焦于**解密、读取、导出与年度总结**等只读能力；**高级版**在此基础上提供 **61 项写入、动作与自动化能力**，覆盖消息修改、消息补录、微信动作、朋友圈同步与互动、群聊与联系人管理，以及自动化任务。当前公开版本仅展示功能说明与演示动画，不包含高级功能的执行实现；实际使用需要匹配微信版本的高级版。
+
+> **获取方式**：进 QQ 3 群 [**1109365501**](https://qm.qq.com/q/2IB0gvYpYA) 私聊咨询群主获取。
+
+| 模块 | 高级版功能 |
+| --- | --- |
+| 消息修改 | 修改文字消息、编辑消息源码、修改时间、字段编辑、恢复原消息、修复为我发送、反转微信气泡位置、删除系统消息 |
+| 消息补录 | 文字、图片、文件、语音、视频、表情、转账记录、红包记录、位置、链接卡片、小程序卡片、视频号卡片、引用消息、合并聊天记录、通话记录、系统消息、拍一拍记录 |
+| 微信动作 | 发送文字消息、发送群聊真 @、发送图片、视频、表情、语音（支持 MP3）、文件、链接卡片、拍一拍，以及单会话标记已读、会话免打扰 |
+| 朋友圈 | 连续同步动态及历史页、朋友圈点赞、图片评论、文字评论、发布朋友圈 |
+| 群聊 | 修改本人群昵称、发布群公告、新建群聊、修改群名称、拉好友进群、邀请成员进群、移除群成员、退出群聊、群成员批量加好友 |
+| 联系人 | 修改好友备注、同意好友请求、添加好友、删除好友、新建标签、设置标签、手机号 / 微信号找人、联系人变化记录 |
+| 自动化任务 | 定时群发任务、新好友备注 / 标签 / 欢迎消息处理、朋友圈跟圈任务（按关键词筛出新动态，自动点赞、评论并跟发同样内容，命中屏蔽词的不发） |
+
+其中**消息修改、消息补录以及会话标记已读、会话免打扰共 27 项直接回写你本机的微信还可同步到手机**，改动均可随时一键还原
 
 ## 可导出的内容
 
@@ -117,7 +158,7 @@
 也欢迎加入下方 QQ 群一起讨论。
 
 <p align="center">
-    <a href="https://qm.qq.com/q/VQEQ7PcGkk">
+    <a href="https://qm.qq.com/q/2IB0gvYpYA">
         <img src="frontend/public/QQImage_1770190010691_1103312318341691201.jpg" alt="WeChatDataAnalysis 加群二维码" width="360" />
     </a>
 </p>
@@ -130,7 +171,6 @@
 2. Windows 下载 `Setup.exe`；macOS 15+ 的 Apple Silicon Mac 下载 `.dmg` 或 `mac.zip`
 3. 安装完成后启动 `WeChatDataAnalysis`
 
-> 如果 Windows 弹出“未知发布者/更多信息”等提示，请确认下载来源为本仓库 Release 后再选择“仍要运行”。
 >
 > macOS 首次打开若提示来源限制，请在“系统设置 → 隐私与安全性”中确认来自本仓库的应用。图片密钥扫描还可能需要授予终端或应用辅助功能权限。
 
@@ -215,6 +255,12 @@ npm run dev
 - API服务(默认): http://localhost:10392 （可通过环境变量 WECHAT_TOOL_PORT 修改）
 - API文档(默认): http://localhost:10392/docs
 
+## 聊天 AI 总结与关注提醒
+
+在「设置 → AI 服务」配置模型后，点击聊天右上角 AI，可按条数或时间批量总结群聊与好友消息，并设置定时总结、消息阈值和 AI 语义关注提醒。支持图片、常见文档分析及桌面通知。详见 [使用与开发说明](docs/chat-ai.md)。
+
+可在「设置 → AI 服务 → 本地检索」按账号开启可选的语义检索，使用 Hugging Face 固定版本模型，支持 CPU 与 NVIDIA GPU 自动回退。使用方法、下载来源和兼容性实测见 [本地语义检索说明](docs/local-semantic-search.md)。
+
 ## MCP 服务
 
 设置页中的“AI 接入提示词”会包含 endpoint 和 Bearer token，可直接复制给客户端作为接入指令。
@@ -286,19 +332,17 @@ npm run dist:mac
 
 ## 致谢
 
-1. **[echotrace](https://github.com/ycccccccy/echotrace)**
-2. **[WeFlow](https://github.com/hicccc77/WeFlow)**
-3. **[wx_key](https://github.com/ycccccccy/wx_key)** 
-4. **[wechat-dump-rs](https://github.com/0xlane/wechat-dump-rs)** 
-5. **[oh-my-wechat](https://github.com/chclt/oh-my-wechat)** 
-6. **[vue3-wechat-tool](https://github.com/Ele-Cat/vue3-wechat-tool)** 
-7. **[wx-dat](https://github.com/waaaaashi/wx-dat)**
-8. **[Ritsu](https://xhslink.com/m/7YJUsd1sgyF)**
-9. **[recarto404](https://github.com/recarto404)**
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=LifeArchiveProject/WeChatDataAnalysis&type=Date)](https://www.star-history.com/#LifeArchiveProject/WeChatDataAnalysis&Date)
+1. **[H3CoF6](https://github.com/H3CoF6)**
+2. **[echotrace](https://github.com/ycccccccy/echotrace)**
+3. **[WeFlow](https://github.com/hicccc77/WeFlow)**
+4. **[wx_key](https://github.com/ycccccccy/wx_key)**
+5. **[wechat-dump-rs](https://github.com/0xlane/wechat-dump-rs)**
+6. **[oh-my-wechat](https://github.com/chclt/oh-my-wechat)**
+7. **[vue3-wechat-tool](https://github.com/Ele-Cat/vue3-wechat-tool)**
+8. **[wx-dat](https://github.com/waaaaashi/wx-dat)**
+9. **[Ritsu](https://xhslink.com/m/7YJUsd1sgyF)**
+10. **[recarto404](https://github.com/recarto404)**
+11. **[xiaoshengbao](https://github.com/xiaoshengbao)**
 
 ## 贡献
 

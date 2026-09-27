@@ -1,5 +1,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { showErrorAlert } from '~/composables/useErrorNotice'
+import { createAnchorContextCache } from '~/utils/anchorContextCache'
+import { useAiApi } from '../useAiApi'
 import {
   dateToUnixSeconds,
   formatMessageFullTime,
@@ -116,6 +118,26 @@ return {
 
 const messageSearchOpen = ref(false)
 const messageSearchQuery = ref('')
+const messageSearchMode = ref('keyword')
+const messageSearchCoverage = ref('')
+const messageSearchTicket = ref('')
+const localSearchSettings = useSettingsDialog()
+const localSearchApi = useAiApi()
+const openLocalSearchSettings = () => localSearchSettings.openDialog('local-search')
+const changeSearchMode = async mode => {
+  if (mode === 'hybrid') {
+    try {
+      const status = await localSearchApi.request('/local-search/status', { query: { account: selectedAccount.value } })
+      if (!status.config?.enabled || !status.config?.active) {
+        messageSearchCoverage.value = '请先启用本地检索并为所选聊天建立索引。'
+        openLocalSearchSettings()
+        return
+      }
+    } catch { messageSearchCoverage.value = '无法读取本地检索状态，请稍后重试'; return }
+  }
+  messageSearchMode.value = mode
+  if (messageSearchQuery.value.trim()) await runMessageSearch({ reset: true, source: 'retrieval-mode' })
+}
 const messageSearchScope = ref('global') // conversation | global
 const messageSearchRangeDays = ref('') // empty means no time filter
 const messageSearchSessionType = ref('') // empty means all (global only): group | single
@@ -230,11 +252,14 @@ return parts.join('，')
 
 const messageSearchIndexText = computed(() => {
 if (!messageSearchIndexInfo.value) return ''
-if (!messageSearchIndexExists.value) return '索引未建立'
-if (messageSearchIndexBuildStatus.value === 'error') return '索引异常'
-if (!messageSearchIndexReady.value) return '索引未完成，需重建'
+// 这里是全文搜索索引，不能让用户误以为已返回结果的语义索引不可用。
+const label = messageSearchMode.value === 'hybrid' ? '关键词索引' : '索引'
+if (messageSearchIndexBuildStatus.value === 'building') return `${label}正在建立`
+if (!messageSearchIndexExists.value) return `${label}未建立`
+if (messageSearchIndexBuildStatus.value === 'error') return `${label}异常`
+if (!messageSearchIndexReady.value) return `${label}未完成，需重建`
 const n = Number(messageSearchIndexMetaCount.value || 0)
-return n > 0 ? `索引已就绪（${n.toLocaleString()} 条）` : '索引已就绪'
+return n > 0 ? `${label}已就绪（${n.toLocaleString()} 条）` : `${label}已就绪`
 })
 
 const messageSearchIndexActionText = computed(() => {
@@ -609,11 +634,14 @@ const timeSidebarCounts = ref({}) // { 'YYYY-MM-DD': count }
 const timeSidebarMax = ref(0)
 const timeSidebarTotal = ref(0)
 const timeSidebarLoading = ref(false)
+const timeSidebarReady = ref(false)
 const timeSidebarError = ref('')
 const timeSidebarSelectedDate = ref('') // YYYY-MM-DD (current/selected day)
 const isJumpingToFirst = ref(false)
-// Simple in-memory cache per (account|username|YYYY-MM)
-const timeSidebarCache = ref({})
+// 只缓存完整统计，按访问顺序淘汰，避免长期浏览积累无界缓存。
+const timeSidebarCache = new Map()
+const TIME_SIDEBAR_CACHE_TTL_MS = 30_000
+const TIME_SIDEBAR_CACHE_LIMIT = 120
 const timeSidebarWeekdays = ['一', '二', '三', '四', '五', '六', '日']
 
 const timeSidebarMonthLabel = computed(() => {
@@ -699,7 +727,8 @@ const timeSidebarCalendarCells = computed(() => {
 
     const dateStr = `${y}-${_pad2(m)}-${_pad2(dayNum)}`
     const count = Math.max(0, Number(counts[dateStr] || 0))
-    const disabled = count <= 0
+    const known = timeSidebarReady.value && !timeSidebarLoading.value && !timeSidebarError.value
+    const disabled = !known || count <= 0
     const style = !disabled
       ? { backgroundColor: _calendarHeatColor(count, Math.max(maxV, count)) }
       : null
@@ -715,11 +744,11 @@ const timeSidebarCalendarCells = computed(() => {
       day: String(dayNum),
       dateStr,
       count,
-      countText: String(count),
+      countText: known ? String(count) : '—',
       disabled,
       className,
       style,
-      title: `${dateStr}：${count} 条`
+      title: known ? `${dateStr}：${count} 条` : `${dateStr}：尚未完成统计`
     })
   }
   return out
@@ -742,18 +771,29 @@ messageSearchDebounceTimer = null
 }
 
 let timeSidebarReqId = 0
+let timeSidebarPending = null
 
-const closeTimeSidebar = () => {
-timeSidebarOpen.value = false
-timeSidebarError.value = ''
+const cancelTimeSidebarRequest = () => {
+  ++timeSidebarReqId
+  timeSidebarPending?.controller.abort()
+  timeSidebarPending = null
+  timeSidebarLoading.value = false
 }
 
-const _timeSidebarCacheKey = ({ account, username, year, month }) => {
+const closeTimeSidebar = () => {
+cancelTimeSidebarRequest()
+timeSidebarOpen.value = false
+timeSidebarError.value = ''
+timeSidebarReady.value = false
+_applyTimeSidebarMonthData(null)
+}
+
+const _timeSidebarCacheKey = ({ account, username, source, year, month }) => {
 const acc = String(account || '').trim()
 const u = String(username || '').trim()
 const y = Number(year || 0)
 const m = Number(month || 0)
-return `${acc}|${u}|${y}-${_pad2(m)}`
+return JSON.stringify([acc, u, source, y, m])
 }
 
 const _applyTimeSidebarMonthData = (data) => {
@@ -763,7 +803,7 @@ timeSidebarMax.value = Math.max(0, Number(data?.max || 0))
 timeSidebarTotal.value = Math.max(0, Number(data?.total || 0))
 }
 
-const loadTimeSidebarMonth = async ({ year, month, force } = {}) => {
+const loadTimeSidebarMonth = ({ year, month, force } = {}) => {
 if (!selectedAccount.value) return
 if (!selectedContact.value?.username) return
 
@@ -777,35 +817,51 @@ timeSidebarMonth.value = m
 const key = _timeSidebarCacheKey({
   account: selectedAccount.value,
   username: selectedContact.value.username,
+  source: DEFAULT_CHAT_SOURCE,
   year: y,
   month: m
 })
 
+if (!force && timeSidebarPending?.key === key) return timeSidebarPending.promise
+// 即使命中缓存，也必须先让上一月份的请求失效。
+cancelTimeSidebarRequest()
+timeSidebarReady.value = false
+timeSidebarError.value = ''
+_applyTimeSidebarMonthData(null)
+const now = Date.now()
+for (const [cacheKey, entry] of timeSidebarCache) {
+  if (now - entry.cachedAt >= TIME_SIDEBAR_CACHE_TTL_MS) timeSidebarCache.delete(cacheKey)
+}
 if (!force) {
-  const cached = timeSidebarCache.value[key]
+  const cached = timeSidebarCache.get(key)
   if (cached) {
-    timeSidebarError.value = ''
-    _applyTimeSidebarMonthData(cached)
+    timeSidebarCache.delete(key)
+    timeSidebarCache.set(key, cached)
+    _applyTimeSidebarMonthData(cached.data)
+    timeSidebarReady.value = true
     return
   }
 }
 
-const reqId = ++timeSidebarReqId
+const reqId = timeSidebarReqId
+const pending = { key, controller: new AbortController(), promise: null }
+timeSidebarPending = pending
 timeSidebarLoading.value = true
-timeSidebarError.value = ''
-
+pending.promise = (async () => {
 try {
   const resp = await api.getChatMessageDailyCounts({
     account: selectedAccount.value,
     username: selectedContact.value.username,
     year: y,
     month: m,
-    source: DEFAULT_CHAT_SOURCE
+    source: DEFAULT_CHAT_SOURCE,
+    signal: pending.controller.signal
   })
   if (reqId !== timeSidebarReqId) return
   if (String(resp?.status || '') !== 'success') {
     throw new Error(String(resp?.message || '加载日历失败'))
   }
+  if (resp?.scanLimited) throw new Error('日历统计不完整，请重试')
 
   const data = {
     counts: resp?.counts || {},
@@ -814,7 +870,12 @@ try {
   }
 
   _applyTimeSidebarMonthData(data)
-  timeSidebarCache.value = { ...timeSidebarCache.value, [key]: data }
+  timeSidebarReady.value = true
+  timeSidebarCache.delete(key)
+  timeSidebarCache.set(key, { data, cachedAt: Date.now() })
+  while (timeSidebarCache.size > TIME_SIDEBAR_CACHE_LIMIT) {
+    timeSidebarCache.delete(timeSidebarCache.keys().next().value)
+  }
 } catch (e) {
   if (reqId !== timeSidebarReqId) return
   timeSidebarError.value = e?.message || '加载日历失败'
@@ -822,9 +883,21 @@ try {
 } finally {
   if (reqId === timeSidebarReqId) {
     timeSidebarLoading.value = false
+    timeSidebarPending = null
   }
 }
+})()
+return pending.promise
 }
+
+const retryTimeSidebarMonth = () => loadTimeSidebarMonth({ force: true })
+
+watch([selectedAccount, () => selectedContact.value?.username], () => {
+  closeTimeSidebar()
+  timeSidebarYear.value = null
+  timeSidebarMonth.value = null
+  timeSidebarSelectedDate.value = ''
+}, { flush: 'sync' })
 
 const _pickTimeSidebarInitialYearMonth = () => {
 const list = messages.value || []
@@ -856,8 +929,11 @@ if (Number(timeSidebarYear.value || 0) !== y || Number(timeSidebarMonth.value ||
 }
 
 const toggleTimeSidebar = async () => {
-timeSidebarOpen.value = !timeSidebarOpen.value
-if (!timeSidebarOpen.value) return
+if (timeSidebarOpen.value) {
+  closeTimeSidebar()
+  return
+}
+timeSidebarOpen.value = true
 closeMessageSearch()
 
 const { year, month } = _pickTimeSidebarInitialYearMonth()
@@ -868,7 +944,7 @@ timeSidebarMonth.value = month
 const list = messages.value || []
 const last = Array.isArray(list) && list.length ? list[list.length - 1] : null
 const ds = _dateStrFromEpochSeconds(Number(last?.createTime || 0))
-if (ds) await _applyTimeSidebarSelectedDate(ds, { syncMonth: false })
+if (ds) timeSidebarSelectedDate.value = ds
 
 await loadTimeSidebarMonth({ year, month, force: false })
 }
@@ -959,6 +1035,7 @@ if (!q) {
 
 if (reset) {
   messageSearchOffset.value = 0
+  messageSearchTicket.value = ''
   messageSearchResults.value = []
   messageSearchSelectedIndex.value = -1
 }
@@ -1025,6 +1102,8 @@ if (scope === 'conversation') {
 }
 
 try {
+  params.retrieval_mode = messageSearchMode.value
+  if (messageSearchTicket.value) params.search_ticket = messageSearchTicket.value
   const resp = await api.searchChatMessages(params)
   if (reqId !== messageSearchReqId) {
     logSearchPhase('runMessageSearch:response:stale', {
@@ -1039,6 +1118,8 @@ try {
   if (resp?.index) {
     messageSearchIndexInfo.value = resp.index
   }
+  messageSearchCoverage.value = resp?.coverage?.message || ''
+  messageSearchTicket.value = resp?.searchTicket || ''
 
   const status = String(resp?.status || 'success')
   messageSearchBackendStatus.value = status
@@ -1096,7 +1177,8 @@ try {
   }
 
   const hits = Array.isArray(resp?.hits) ? resp.hits : []
-  if (reset) {
+  if(resp?.resetSearch) messageSearchSelectedIndex.value=-1
+  if (reset || resp?.resetSearch) {
     messageSearchResults.value = hits
   } else {
     messageSearchResults.value = [...messageSearchResults.value, ...hits]
@@ -1337,12 +1419,55 @@ try {
 }
 }
 
-const locateByAnchorId = async ({ targetUsername, anchorId, kind, label } = {}) => {
-if (!process.client) return
-if (!selectedAccount.value) return
+const anchorContextCache = createAnchorContextCache(async params => {
+  const response = await api.getChatMessagesAround({ ...params, ai_diagnostic: true })
+  if (!response?.messages?.length) throw new Error('未找到原消息，记录可能已更新或移除')
+  return response
+})
+let anchorNavigationVersion = 0
+watch(selectedAccount, () => { anchorContextCache.clear(); ++anchorNavigationVersion }, { flush: 'sync' })
+onUnmounted(() => { anchorContextCache.clear(); ++anchorNavigationVersion })
+const anchorParams = (account, username, anchor) => ({ account, username, anchor_id: anchor, before: 35, after: 35, source: DEFAULT_CHAT_SOURCE })
+const prepareAnchorContext = ({ targetUsername, anchorId } = {}) => {
+  const account = selectedAccount.value, username = String(targetUsername || '').trim(), anchor = String(anchorId || '').trim()
+  if (!account || !username || !anchor) return
+  const cached = allMessages.value[username] || []
+  const cachedIndex = cached.findIndex(message => String(message.id) === anchor)
+  // 已加载的原消息可直接用于 AI 出处对照，无需再次请求同一段聊天。
+  if (cachedIndex >= 0) {
+    const start = Math.max(0, cachedIndex - 2)
+    return { messages: cached.slice(start, cachedIndex + 3), anchorId: anchor, anchorIndex: cachedIndex - start }
+  }
+  return anchorContextCache.read(anchorParams(account, username, anchor))
+}
+const locateByAnchorId = async ({ targetUsername, anchorId, kind, label, throwOnError = false } = {}) => {
+if (!process.client) return false
+if (!selectedAccount.value) {
+  if (throwOnError) throw new Error('请先选择聊天账号')
+  return false
+}
 const u = String(targetUsername || selectedContact.value?.username || '').trim()
 const anchor = String(anchorId || '').trim()
-if (!u || !anchor) return
+if (!u || !anchor) {
+  if (throwOnError) throw new Error('该来源缺少定位信息')
+  return false
+}
+const account = selectedAccount.value, navigationVersion = ++anchorNavigationVersion
+const stillCurrent = () => navigationVersion === anchorNavigationVersion && selectedAccount.value === account && selectedContact.value?.username === u
+
+// 已显示的消息直接滚动并高亮，避免相同引用反复读取数据库。
+if (kind === 'ai' && selectedContact.value?.username === u && allMessages.value[u]?.some(message => String(message.id) === anchor)) {
+  const found = await scrollToMessageId(anchor)
+  if (!stillCurrent()) return false
+  if (found) {
+    if (searchContext.value.active) {
+      searchContext.value.anchorId = anchor
+      searchContext.value.kind = 'ai'
+      searchContext.value.label = String(label || '')
+    }
+    flashMessage(anchor); return true
+  }
+}
 
 const targetContact = resolveSearchTargetContact({
   username: u,
@@ -1354,6 +1479,8 @@ if (targetContact && selectedContact.value?.username !== u) {
   await selectContact(targetContact, { skipLoadMessages: true })
 }
 
+if (!stillCurrent()) return false
+
 if (searchContext.value?.active && searchContext.value.username !== u) {
   await exitSearchContext()
 }
@@ -1361,6 +1488,7 @@ if (searchContext.value?.active && searchContext.value.username !== u) {
 const kindNorm = String(kind || 'search').trim() || 'search'
 const labelNorm = String(label || '').trim()
 const hasMoreBeforeInit = kindNorm === 'first' ? false : true
+const previousContext = { ...searchContext.value }
 
 if (!searchContext.value?.active) {
   searchContext.value = {
@@ -1388,20 +1516,20 @@ if (!searchContext.value?.active) {
   searchContext.value.loadingAfter = false
 }
 
+let applied = false
+const context = searchContext.value
 try {
-  const resp = await api.getChatMessagesAround({
-    account: selectedAccount.value,
-    username: u,
-    anchor_id: anchor,
-    before: 35,
-    after: 35,
-    source: DEFAULT_CHAT_SOURCE
-  })
+  const params = anchorParams(account, u, anchor)
+  const resp = await (kindNorm === 'ai' ? anchorContextCache.read(params) : api.getChatMessagesAround(params))
+  // 切换账号、会话或退出定位后，旧请求不得覆盖当前聊天。
+  if (!stillCurrent() || searchContext.value !== context || !context.active || context.anchorId !== anchor) return false
 
   const raw = resp?.messages || []
+  if (!raw.length) throw new Error('未找到原消息，记录可能已更新或移除')
   const mapped = raw.map(normalizeMessage)
   allMessages.value = { ...allMessages.value, [u]: mapped }
   messagesMeta.value = { ...messagesMeta.value, [u]: { total: mapped.length, hasMore: false } }
+  applied = true
 
   searchContext.value.anchorId = String(resp?.anchorId || anchor)
   searchContext.value.anchorIndex = Number(resp?.anchorIndex ?? -1)
@@ -1415,10 +1543,17 @@ try {
     if (firstMessageId) flashMessage(firstMessageId)
   } else {
     const ok = await scrollToMessageId(searchContext.value.anchorId)
+    if (!stillCurrent()) return false
     if (ok) flashMessage(searchContext.value.anchorId)
+    else throw new Error('原消息暂未显示，请重试定位')
   }
+  return true
 } catch (e) {
+  if (!stillCurrent()) return false
+  if (!applied && searchContext.value === context && context.anchorId === anchor) searchContext.value = previousContext
+  if (throwOnError) throw e
   showErrorAlert(e?.message || '定位失败')
+  return false
 }
 }
 
@@ -1482,7 +1617,7 @@ try {
 }
 
 const onTimeSidebarDayClick = async (cell) => {
-if (!cell || cell.disabled) return
+if (!timeSidebarReady.value || timeSidebarLoading.value || timeSidebarError.value || !cell || cell.disabled) return
 const ds = String(cell.dateStr || '').trim()
 if (!ds) return
 await locateByDate(ds)
@@ -2026,6 +2161,8 @@ if (c.scrollTop <= 240 && autoLoadReady.value && hasMoreMessages.value && !isLoa
   })
 
   onUnmounted(() => {
+    cancelTimeSidebarRequest()
+    timeSidebarCache.clear()
     if (messageSearchDebounceTimer) clearTimeout(messageSearchDebounceTimer)
     messageSearchDebounceTimer = null
     stopMessageSearchIndexPolling()
@@ -2037,6 +2174,10 @@ if (c.scrollTop <= 240 && autoLoadReady.value && hasMoreMessages.value && !isLoa
 
   return {
     messageSearchOpen,
+    messageSearchMode,
+    messageSearchCoverage,
+    changeSearchMode,
+    openLocalSearchSettings,
     messageSearchQuery,
     messageSearchScope,
     messageSearchRangeDays,
@@ -2087,6 +2228,7 @@ if (c.scrollTop <= 240 && autoLoadReady.value && hasMoreMessages.value && !isLoa
     timeSidebarMax,
     timeSidebarTotal,
     timeSidebarLoading,
+    timeSidebarReady,
     timeSidebarError,
     timeSidebarSelectedDate,
     isJumpingToFirst,
@@ -2108,6 +2250,7 @@ if (c.scrollTop <= 240 && autoLoadReady.value && hasMoreMessages.value && !isLoa
     closeMessageSearch,
     closeTimeSidebar,
     loadTimeSidebarMonth,
+    retryTimeSidebarMonth,
     toggleTimeSidebar,
     prevTimeSidebarMonth,
     nextTimeSidebarMonth,
@@ -2119,6 +2262,7 @@ if (c.scrollTop <= 240 && autoLoadReady.value && hasMoreMessages.value && !isLoa
     exitSearchContext,
     locateSearchHit,
     locateByAnchorId,
+    prepareAnchorContext,
     locateByDate,
     jumpToConversationFirst,
     onTimeSidebarDayClick,

@@ -4,21 +4,73 @@
       <div
         v-if="open"
         class="guide-dialog-overlay"
+        :class="{ 'guide-dialog-overlay--export': exportStyle }"
         @mousedown.self="requestClose"
       >
         <section
           ref="dialogPanel"
           class="guide-dialog-panel theme-scope"
+          :class="{
+            'guide-dialog-panel--wide': wide,
+            'guide-dialog-panel--export': exportStyle,
+            'app-export-modal': exportStyle
+          }"
           role="dialog"
           aria-modal="true"
           :aria-labelledby="titleId"
-          :aria-describedby="descriptionId"
+          :aria-describedby="description ? descriptionId : undefined"
           tabindex="-1"
         >
-          <div class="guide-dialog-body">
-            <p v-if="eyebrow" class="guide-dialog-eyebrow" :data-tone="tone">{{ eyebrow }}</p>
-            <h2 :id="titleId" class="guide-dialog-title">{{ title }}</h2>
-            <p :id="descriptionId" class="guide-dialog-description">{{ description }}</p>
+          <button
+            v-if="showCloseIcon && !exportStyle"
+            type="button"
+            class="guide-dialog-close"
+            aria-label="关闭"
+            @click="requestClose"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <path d="M6 6l12 12M18 6 6 18" />
+            </svg>
+          </button>
+
+          <header v-if="exportStyle" class="app-export-header">
+            <div class="app-export-header__icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 8h16v11H4z" />
+                <path d="M9 8V5h6v3M4 12h16" />
+                <path d="M10 12v2h4v-2" />
+              </svg>
+            </div>
+            <div class="app-export-header__copy">
+              <div class="app-export-header__title-row">
+                <h2 :id="titleId">{{ title }}</h2>
+                <span v-if="badge" class="app-export-badge app-export-badge--warning">{{ badge }}</span>
+                <slot name="title-extra" />
+              </div>
+              <p v-if="description" :id="descriptionId">{{ description }}</p>
+            </div>
+            <button
+              v-if="showCloseIcon"
+              type="button"
+              class="app-export-icon-button"
+              aria-label="关闭"
+              @click="requestClose"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                <path d="M6 6l12 12M18 6 6 18" />
+              </svg>
+            </button>
+          </header>
+
+          <div :class="exportStyle ? 'guide-dialog-export-body' : 'guide-dialog-body'">
+            <template v-if="!exportStyle">
+              <p v-if="eyebrow" class="guide-dialog-eyebrow" :data-tone="tone">{{ eyebrow }}</p>
+              <div class="guide-dialog-title-row">
+                <h2 :id="titleId" class="guide-dialog-title">{{ title }}</h2>
+                <slot name="title-extra" />
+              </div>
+              <p v-if="description" :id="descriptionId" class="guide-dialog-description">{{ description }}</p>
+            </template>
 
             <!-- 要点用编号 + 发丝分隔，读起来像规格说明，不再是彩框里的绿勾清单 -->
             <ol v-if="details.length" class="guide-dialog-details">
@@ -28,34 +80,42 @@
               </li>
             </ol>
 
+            <slot />
+
             <p v-if="note" class="guide-dialog-note">{{ note }}</p>
 
             <ErrorNotice v-if="errorMessage" :message="errorMessage" compact class="guide-dialog-error" />
           </div>
 
-          <footer class="guide-dialog-actions" :data-actions="secondaryLabel ? 'two' : 'one'">
-            <button
-              v-if="secondaryLabel"
-              type="button"
-              class="guide-dialog-button guide-dialog-button--secondary"
-              :disabled="busy"
-              @click="$emit('secondary')"
-            >
-              {{ secondaryLabel }}
-            </button>
-            <button
-              ref="primaryButton"
-              type="button"
-              class="guide-dialog-button guide-dialog-button--primary"
-              :disabled="busy"
-              @click="$emit('primary')"
-            >
-              <svg v-if="busy" class="guide-dialog-spinner" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" opacity="0.25" />
-                <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
-              </svg>
-              {{ primaryLabel }}
-            </button>
+          <footer
+            v-if="primaryLabel || secondaryLabel"
+            :class="exportStyle ? 'app-export-footer guide-dialog-export-footer' : 'guide-dialog-actions'"
+            :data-actions="secondaryLabel ? 'two' : 'one'"
+          >
+            <div :class="exportStyle ? 'app-export-footer__actions' : 'guide-dialog-action-buttons'">
+              <button
+                v-if="secondaryLabel"
+                type="button"
+                :class="exportStyle ? 'app-export-secondary-button' : 'guide-dialog-button guide-dialog-button--secondary'"
+                :disabled="busy"
+                @click="$emit('secondary')"
+              >
+                {{ secondaryLabel }}
+              </button>
+              <button
+                ref="primaryButton"
+                type="button"
+                :class="exportStyle ? 'app-export-primary-button' : 'guide-dialog-button guide-dialog-button--primary'"
+                :disabled="busy"
+                @click="$emit('primary')"
+              >
+                <svg v-if="busy" class="guide-dialog-spinner" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="3" opacity="0.25" />
+                  <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+                </svg>
+                {{ primaryLabel }}
+              </button>
+            </div>
           </footer>
         </section>
       </div>
@@ -78,7 +138,11 @@ const props = defineProps({
   secondaryLabel: { type: String, default: '' },
   tone: { type: String, default: 'guide' },
   busy: { type: Boolean, default: false },
-  dismissible: { type: Boolean, default: true }
+  dismissible: { type: Boolean, default: true },
+  wide: { type: Boolean, default: false },
+  showCloseIcon: { type: Boolean, default: false },
+  exportStyle: { type: Boolean, default: false },
+  badge: { type: String, default: '' }
 })
 
 const emit = defineEmits(['primary', 'secondary', 'close'])
@@ -103,7 +167,7 @@ const onKeydown = (event) => {
   if (event.key !== 'Tab') return
 
   const focusable = Array.from(
-    dialogPanel.value?.querySelectorAll('button:not(:disabled), [href], input:not(:disabled), [tabindex]:not([tabindex="-1"])') || []
+    dialogPanel.value?.querySelectorAll('button:not(:disabled), [href], input:not(:disabled), textarea:not(:disabled), select:not(:disabled), [tabindex]:not([tabindex="-1"])') || []
   )
   if (!focusable.length) {
     event.preventDefault()
@@ -155,8 +219,16 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown))
   background: rgba(14, 22, 18, 0.44);
 }
 
+.guide-dialog-overlay--export {
+  z-index: 12000;
+  padding: 16px;
+  background: rgba(25, 25, 25, 0.48);
+  backdrop-filter: blur(2px);
+}
+
 /* 一整块连续表面：不分头/身/脚色带，层级交给字号、留白和发丝线 */
 .guide-dialog-panel {
+  position: relative;
   display: flex;
   width: min(460px, 100%);
   max-height: min(760px, calc(100vh - 48px));
@@ -167,6 +239,105 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown))
   background: #ffffff;
   color: #16201a;
   outline: none;
+}
+
+.guide-dialog-panel--export {
+  width: min(460px, calc(100vw - 32px));
+  height: auto;
+  min-height: 0;
+  max-height: min(760px, calc(100dvh - 32px));
+  border-radius: 8px;
+}
+
+.guide-dialog-panel--export.guide-dialog-panel--wide {
+  width: min(1000px, calc(100vw - 32px));
+  max-height: min(720px, calc(100dvh - 32px));
+}
+
+.guide-dialog-export-body {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  background: var(--app-surface-soft);
+}
+
+.guide-dialog-export-body:empty { display: none; }
+
+.guide-dialog-export-footer { justify-content: flex-end; }
+
+.guide-dialog-export-footer[data-actions='two'] .app-export-footer__actions {
+  display: grid;
+  width: 100%;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.guide-dialog-export-footer[data-actions='two'] :is(.app-export-secondary-button, .app-export-primary-button) {
+  width: 100%;
+}
+.guide-dialog-action-buttons { display: contents; }
+
+.guide-dialog-panel--export .app-export-header + .app-export-footer {
+  border-top: 0;
+}
+
+.guide-dialog-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 1;
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: #8a948e;
+  transition: color 150ms ease, background-color 150ms ease;
+}
+
+.guide-dialog-close:hover {
+  color: #26312b;
+  background: rgba(16, 32, 24, 0.05);
+}
+
+.guide-dialog-close svg {
+  width: 16px;
+  height: 16px;
+}
+
+.guide-dialog-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-right: 32px;
+}
+
+.guide-dialog-title-row .guide-dialog-title {
+  min-width: 0;
+}
+
+.guide-dialog-panel--wide {
+  width: min(1000px, 100%);
+  max-height: min(720px, calc(100vh - 48px));
+}
+
+.guide-dialog-panel--wide .guide-dialog-body {
+  padding: 24px 24px 18px;
+}
+
+.guide-dialog-panel--wide .guide-dialog-title {
+  font-size: 18px;
+}
+
+.guide-dialog-panel--wide .guide-dialog-description {
+  margin-top: 6px;
+  font-size: 12.5px;
+}
+
+.guide-dialog-panel--wide .guide-dialog-actions[data-actions='one'] {
+  grid-template-columns: 96px;
+  justify-content: end;
+  padding: 14px 24px 20px;
 }
 
 .guide-dialog-body {
@@ -376,6 +547,15 @@ html[data-theme='dark'] .guide-dialog-button--secondary {
 
 html[data-theme='dark'] .guide-dialog-button--secondary:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.06);
+}
+
+html[data-theme='dark'] .guide-dialog-close {
+  color: var(--setup-text-muted);
+}
+
+html[data-theme='dark'] .guide-dialog-close:hover {
+  color: var(--app-text-primary);
+  background: rgba(255, 255, 255, 0.07);
 }
 
 @media (max-width: 520px) {

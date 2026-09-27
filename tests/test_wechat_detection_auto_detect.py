@@ -170,6 +170,7 @@ class TestWechatDetectionAutoDetect(unittest.TestCase):
             with (
                 patch.object(wd, "_build_auto_detect_scan_paths", return_value=[str(nested_scan_root)]),
                 patch.object(wd, "get_process_list", return_value=[]),
+                patch.object(wd, "_get_xwechat_data_dir_from_config", return_value=None),
             ):
                 detected_dirs = wd.auto_detect_wechat_data_dirs()
                 result = wd.detect_wechat_installation()
@@ -185,6 +186,9 @@ class TestWechatDetectionAutoDetect(unittest.TestCase):
 
         with TemporaryDirectory() as td:
             version_root = Path(td) / "2.0b4.0.9"
+            key_value_dir = version_root / "KeyValue" / "account_hash"
+            key_value_dir.mkdir(parents=True)
+            (key_value_dir / "KeyValue.db").write_bytes(b"demo")
             account_dir = version_root / "xwechat_files" / "wxid_demo_abcd"
             db_storage = account_dir / "db_storage"
             db_storage.mkdir(parents=True)
@@ -232,6 +236,206 @@ class TestWechatDetectionAutoDetect(unittest.TestCase):
 
             self.assertEqual(detected_dirs, [str(xwechat_root)])
             self.assertEqual([item["account_name"] for item in accounts], ["wxid_demo_suffix"])
+
+
+    def test_xwechat_config_ini_real_path_returns_data_root(self):
+        import hashlib
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            data_root = root / "xwechat_files"
+            data_root.mkdir(parents=True)
+            appdata = Path(td) / "appdata"
+            config_dir = appdata / "Tencent" / "xwechat" / "config"
+            config_dir.mkdir(parents=True)
+            ini_name = hashlib.md5(wd.XWECHAT_CONFIG_KEY_NAME.encode("utf-8")).hexdigest() + ".ini"
+            (config_dir / ini_name).write_text(str(root), encoding="utf-8")
+
+            with (
+                patch.object(wd.sys, "platform", "win32"),
+                patch.dict(os.environ, {"APPDATA": str(appdata)}),
+            ):
+                result = wd._get_xwechat_data_dir_from_config()
+
+        self.assertEqual(result, str(data_root))
+
+    def test_xwechat_config_ini_my_document_token(self):
+        import hashlib
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            data_root = root / "xwechat_files"
+            data_root.mkdir(parents=True)
+            appdata = Path(td) / "appdata"
+            config_dir = appdata / "Tencent" / "xwechat" / "config"
+            config_dir.mkdir(parents=True)
+            ini_name = hashlib.md5(wd.XWECHAT_CONFIG_KEY_NAME.encode("utf-8")).hexdigest() + ".ini"
+            (config_dir / ini_name).write_text("MyDocument:1073741829", encoding="utf-8")
+
+            with (
+                patch.object(wd.sys, "platform", "win32"),
+                patch.dict(os.environ, {"APPDATA": str(appdata)}),
+                patch.object(wd, "_resolve_known_folder", return_value=str(root)),
+            ):
+                result = wd._get_xwechat_data_dir_from_config()
+
+        self.assertEqual(result, str(data_root))
+
+    def test_xwechat_config_ini_missing_returns_none(self):
+        import hashlib
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        with TemporaryDirectory() as td:
+            appdata = Path(td) / "appdata"
+            appdata.mkdir()
+            with (
+                patch.object(wd.sys, "platform", "win32"),
+                patch.dict(os.environ, {"APPDATA": str(appdata)}),
+            ):
+                result = wd._get_xwechat_data_dir_from_config()
+
+        self.assertIsNone(result)
+
+    def test_xwechat_config_ini_data_root_not_exists_returns_none(self):
+        import hashlib
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        with TemporaryDirectory() as td:
+            root = Path(td) / "root"
+            root.mkdir()
+            appdata = Path(td) / "appdata"
+            config_dir = appdata / "Tencent" / "xwechat" / "config"
+            config_dir.mkdir(parents=True)
+            ini_name = hashlib.md5(wd.XWECHAT_CONFIG_KEY_NAME.encode("utf-8")).hexdigest() + ".ini"
+            (config_dir / ini_name).write_text(str(root), encoding="utf-8")
+
+            with (
+                patch.object(wd.sys, "platform", "win32"),
+                patch.dict(os.environ, {"APPDATA": str(appdata)}),
+            ):
+                result = wd._get_xwechat_data_dir_from_config()
+
+        self.assertIsNone(result)
+
+    def test_auto_detect_injects_xwechat_config_dir_first(self):
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        with TemporaryDirectory() as td:
+            data_root = Path(td) / "xwechat_files"
+            data_root.mkdir()
+            with (
+                patch.object(wd.sys, "platform", "win32"),
+                patch.object(wd, "_get_xwechat_data_dir_from_config", return_value=str(data_root)),
+                patch.object(wd, "_build_auto_detect_scan_paths", return_value=[]),
+                patch.object(wd, "get_process_list", return_value=[]),
+            ):
+                result = wd.auto_detect_wechat_data_dirs()
+
+        self.assertEqual(result, [str(data_root)])
+
+
+    def test_parse_global_config_falls_back_to_len_in_crc_meta(self):
+        """有的微信版本把 global_config 文件头写成 0，真正的长度在 crc 的 28..32。"""
+        import struct
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        def varint(n):
+            out = bytearray()
+            while True:
+                b = n & 0x7F
+                n >>= 7
+                if n:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        body = bytearray()
+        for key_name, value in (("mmkv_key_user_name", "wxid_zero_header"), ("mmkv_key_nick_name", "ZeroHeader")):
+            kb = key_name.encode("utf-8"); vb = value.encode("utf-8")
+            payload = varint(len(vb)) + vb
+            body += varint(len(kb)) + kb + varint(len(payload)) + payload
+        plaintext = b"\x00\x00\x00\x00" + bytes(body)
+        iv = b"\x22" * 16
+        encryptor = Cipher(algorithms.AES(wd._GLOBAL_CONFIG_CRYPT_KEY), modes.CFB(iv)).encryptor()
+        encrypted = encryptor.update(plaintext) + encryptor.finalize()
+
+        with TemporaryDirectory() as td:
+            config_dir = Path(td) / "all_users" / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "global_config").write_bytes(b"\x00\x00\x00\x00" + encrypted)   # 文件头是 0
+            (config_dir / "global_config.crc").write_bytes(
+                b"\x00" * 12 + iv + struct.pack("<I", len(encrypted)) + b"\x00" * 12
+            )
+            result = wd.parse_global_config(td)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["wxid"], "wxid_zero_header")
+        self.assertEqual(result["nickname"], "ZeroHeader")
+
+    def test_parse_global_config_uses_iv_from_crc_meta(self):
+        import struct
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        def varint(n):
+            out = bytearray()
+            while True:
+                b = n & 0x7F
+                n >>= 7
+                if n:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        key = wd._GLOBAL_CONFIG_CRYPT_KEY
+        entries = [
+            ("mmkv_key_user_name", "wxid_demo"),
+            ("mmkv_key_nick_name", "DemoNick"),
+            ("mmkv_key_head_img_url", "http://example.com/avatar/0"),
+            ("some_other", "value"),
+        ]
+        body = bytearray()
+        for key_name, value in entries:
+            key_bytes = key_name.encode("utf-8")
+            value_bytes = value.encode("utf-8")
+            # 字符串 value 内部还有一层 varint 长度前缀
+            value_payload = varint(len(value_bytes)) + value_bytes
+            body += varint(len(key_bytes)) + key_bytes + varint(len(value_payload)) + value_payload
+        plaintext = b"\x00\x00\x00\x00" + bytes(body)
+        iv = b"\x11" * 16
+        encryptor = Cipher(algorithms.AES(key), modes.CFB(iv)).encryptor()
+        encrypted = encryptor.update(plaintext) + encryptor.finalize()
+
+        with TemporaryDirectory() as td:
+            config_dir = Path(td) / "all_users" / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "global_config").write_bytes(struct.pack("<I", len(plaintext)) + encrypted)
+            (config_dir / "global_config.crc").write_bytes(b"\x00" * 12 + iv + b"\x00" * 16)
+
+            result = wd.parse_global_config(td)
+
+        self.assertEqual(result, {
+            "wxid": "wxid_demo",
+            "nickname": "DemoNick",
+            "avatar": "http://example.com/avatar/0",
+        })
+
+    def test_parse_global_config_missing_crc_returns_none(self):
+        from wechat_decrypt_tool import wechat_detection as wd
+
+        with TemporaryDirectory() as td:
+            config_dir = Path(td) / "all_users" / "config"
+            config_dir.mkdir(parents=True)
+            (config_dir / "global_config").write_bytes(b"\x00" * 8)
+
+            result = wd.parse_global_config(td)
+
+        self.assertIsNone(result)
 
 
 if __name__ == "__main__":

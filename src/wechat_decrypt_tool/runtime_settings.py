@@ -16,6 +16,7 @@ VOICE_TRANSCRIPTION_DEVICE_KEY = "voice_transcription_device"
 VOICE_TRANSCRIPTION_MODEL_KEY = "voice_transcription_model"
 ENV_PORT_KEY = "WECHAT_TOOL_PORT"
 ENV_HOST_KEY = "WECHAT_TOOL_HOST"
+ENV_ALLOW_REMOTE_CALLS_KEY = "WECHAT_TOOL_ALLOW_REMOTE_CALLS"
 ENV_MCP_TOKEN_KEY = "WECHAT_TOOL_MCP_TOKEN"
 ENV_VOICE_TRANSCRIPTION_DEVICE_KEY = "WECHAT_TOOL_WHISPER_DEVICE"
 ENV_VOICE_TRANSCRIPTION_MODEL_KEY = "WECHAT_TOOL_WHISPER_MODEL"
@@ -25,6 +26,25 @@ LOOPBACK_BACKEND_HOST = "127.0.0.1"
 LAN_BACKEND_HOST = "0.0.0.0"
 VOICE_TRANSCRIPTION_DEVICE_CPU = "cpu"
 VOICE_TRANSCRIPTION_DEVICE_CUDA = "cuda"
+
+
+def remote_calls_enabled(default: bool = False) -> bool:
+    """Return whether caller-location checks are explicitly relaxed.
+
+    This is deliberately opt-in.  It does not disable MCP token checks, native
+    leases/build expiry, feature bits, path validation, or resource limits.
+    """
+
+    raw = str(os.environ.get(ENV_ALLOW_REMOTE_CALLS_KEY, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+def default_backend_host() -> str:
+    """Choose the bind default without overriding explicit host settings."""
+
+    return LAN_BACKEND_HOST if remote_calls_enabled() else LOOPBACK_BACKEND_HOST
 
 
 def _parse_port(value: object) -> int | None:
@@ -295,7 +315,7 @@ def write_voice_transcription_model_setting(model: str | None) -> None:
         return
 
 
-def read_effective_voice_transcription_model(default: str = "medium") -> tuple[str, str]:
+def read_effective_voice_transcription_model(default: str = "zipformer-small-ctc-int8") -> tuple[str, str]:
     """Return the Whisper model preference and its source: env | settings | default."""
 
     env_model = _normalize_voice_transcription_model(os.environ.get(ENV_VOICE_TRANSCRIPTION_MODEL_KEY, ""))
@@ -306,7 +326,7 @@ def read_effective_voice_transcription_model(default: str = "medium") -> tuple[s
     if settings_model is not None:
         return settings_model, "settings"
 
-    return _normalize_voice_transcription_model(default) or "medium", "default"
+    return _normalize_voice_transcription_model(default) or "zipformer-small-ctc-int8", "default"
 
 
 def ensure_mcp_token() -> tuple[str, str]:

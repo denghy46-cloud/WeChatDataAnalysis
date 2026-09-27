@@ -173,8 +173,9 @@ class SnsRealtimeAutoSyncService:
         """启动时只枚举一次账号；后续账号由 SSE 连接动态注册。"""
         try:
             accounts = list(_list_decrypted_accounts() or [])
-        except Exception:
+        except Exception as exc:
             logger.exception("[sns-autosync] 初始账号枚举失败")
+            logger.error("[sns.incremental-sync] status=error phase=account-scan error_type=%s", type(exc).__name__)
             return
         for account in accounts:
             if self._stop.is_set():
@@ -311,9 +312,10 @@ class SnsRealtimeAutoSyncService:
             if not self._stop.is_set():
                 logger.error("[sns-autosync] 系统文件监听意外结束")
                 self._mark_watcher_failed(watch_key, "sns_file_watch_unavailable")
-        except Exception:
+        except Exception as exc:
             if not self._stop.is_set():
                 logger.exception("[sns-autosync] 系统文件监听失败")
+                logger.error("[sns.incremental-sync] status=error phase=file-watch error_type=%s", type(exc).__name__)
                 self._mark_watcher_failed(watch_key, "sns_file_watch_unavailable")
 
     def _mark_watcher_failed(self, watch_key: str, code: str) -> None:
@@ -362,13 +364,17 @@ class SnsRealtimeAutoSyncService:
 
         try:
             worker.start()
-        except Exception:
+        except Exception as exc:
             with self._mu:
                 state = self._states.get(account)
                 if state is not None and state.worker is worker:
                     state.sync_running = False
                     state.worker = None
             logger.exception("[sns-autosync] 启动同步线程失败 account=%s", account)
+            logger.error(
+                "[sns.incremental-sync] status=error phase=worker-start error_type=%s",
+                type(exc).__name__,
+            )
             self._publish_error(
                 account,
                 source_revision=revision,
@@ -381,6 +387,12 @@ class SnsRealtimeAutoSyncService:
         current_thread = threading.current_thread()
         try:
             while not self._stop.is_set():
+                sync_id = uuid.uuid4().hex
+                started = time.monotonic()
+                logger.info(
+                    "[sns.incremental-sync] status=running request_id=%s phase=scanning",
+                    sync_id,
+                )
                 result, superseded = self._sync_with_bounded_retries(account, revision)
                 # WCDB 读取可能刷新共享内存文件；短暂忽略纯 -shm 事件，防止读取自身形成事件环。
                 with self._mu:
@@ -392,6 +404,15 @@ class SnsRealtimeAutoSyncService:
                         )
                 if not superseded and not self._stop.is_set():
                     self._publish_sync_result(account, reason, revision, result)
+                    status = str((result or {}).get("status") or "error").strip().lower()
+                    logger.info(
+                        "[sns.incremental-sync] status=%s request_id=%s phase=finalizing scanned=%s changed=%s elapsed_ms=%s",
+                        status,
+                        sync_id,
+                        int((result or {}).get("scanned") or 0),
+                        int((result or {}).get("changed") or (result or {}).get("upserted") or 0),
+                        int((time.monotonic() - started) * 1000),
+                    )
 
                 with self._mu:
                     state = self._states.get(account)
@@ -424,8 +445,13 @@ class SnsRealtimeAutoSyncService:
                     if self._stop.is_set():
                         return {"status": "skipped", "reason": "service_stopping"}, False
                     last_result = dict(self._sync_account(account) or {})
-            except Exception:
+            except Exception as exc:
                 logger.exception("[sns-autosync] 同步失败 account=%s", account)
+                logger.error(
+                    "[sns.incremental-sync] status=error phase=scanning error_type=%s attempt=%s",
+                    type(exc).__name__,
+                    attempt + 1,
+                )
                 last_result = {"status": "error", "error": "sns_sync_failed"}
 
             if not self._should_retry(last_result) or attempt >= len(self._retry_delays):
@@ -478,8 +504,12 @@ class SnsRealtimeAutoSyncService:
             )
         except HTTPException as exc:
             return {"status": "error", "error": str(exc.detail or "sns_sync_failed")}
-        except Exception:
+        except Exception as exc:
             logger.exception("[sns-autosync] 增量同步调用失败 account=%s", account)
+            logger.error(
+                "[sns.incremental-sync] status=error phase=scanning error_type=%s",
+                type(exc).__name__,
+            )
             return {"status": "error", "error": "sns_sync_failed"}
 
     def subscribe(
@@ -604,6 +634,10 @@ class SnsRealtimeAutoSyncService:
                 subscriber.loop.call_soon_threadsafe(self._offer_latest, subscriber.queue, payload)
             except Exception:
                 pass
+
+    def publish_external_event(self, account: str, event: dict[str, Any]) -> None:
+        """向当前账号的 SSE 订阅者投递外部同步事件。"""
+        self._publish_event(account, event)
 
 
 SNS_REALTIME_AUTOSYNC = SnsRealtimeAutoSyncService()

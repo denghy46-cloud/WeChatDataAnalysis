@@ -3,6 +3,7 @@ const {
   BrowserWindow,
   Menu,
   Tray,
+  Notification,
   nativeImage,
   ipcMain,
   globalShortcut,
@@ -44,6 +45,7 @@ const {
   shouldRetryBackendOnDifferentPort,
 } = require("./backend-startup.cjs");
 const { applyNativeCoreRuntimePolicy } = require("./native-core-runtime.cjs");
+const { loadWithRedirect, resolveDesktopUiUrl } = require("./renderer-startup.cjs");
 const {
   ENV_INTEGRITY_NATIVE_PATH,
   ENV_MACOS_DB_KEY_BUNDLE,
@@ -54,10 +56,9 @@ const {
 const { resolveNativeCoreRuntimeDir } = require("./native-core-path.cjs");
 const {
   configurePrivatePkiUpdateVerification,
-  ensurePrivatePkiIssuerCached,
+  resolvePrivatePkiRuntime,
 } = require("./windows-private-pki-runtime.cjs");
 const { ensureMacosPrivatePkiTrust } = require("./macos-private-pki-runtime.cjs");
-const { isSameOriginNavigationAbort } = require("./window-load.cjs");
 
 const DEFAULT_BACKEND_HOST = "127.0.0.1";
 const LAN_BACKEND_HOST = "0.0.0.0";
@@ -67,6 +68,8 @@ const DESKTOP_TITLEBAR_HEIGHT = 32;
 let backendProc = null;
 let resolvedDataDir = null;
 let mainWindow = null;
+let aiNotifications = null;
+let aiDiagnostics = null;
 let mainWindowLaunchPromise = null;
 let initialStartupPromise = null;
 let tray = null;
@@ -287,9 +290,12 @@ function getBackendUiUrl() {
 }
 
 function getDesktopUiUrl() {
-  const explicit = String(process.env.ELECTRON_START_URL || "").trim();
-  if (explicit) return explicit;
-  return app.isPackaged ? getBackendUiUrl() : "http://localhost:3000";
+  return resolveDesktopUiUrl({
+    startUrl: process.env.ELECTRON_START_URL,
+    backendUrl: getBackendUiUrl(),
+    isPackaged: app.isPackaged,
+    staticUi: process.env.WECHAT_TOOL_STATIC_UI === "1",
+  });
 }
 
 function isPortAvailable(port, host) {
@@ -843,9 +849,12 @@ function getDesktopSettingsPath() {
 }
 
 function getPackagedUiDir() {
-  if (!app.isPackaged) return null;
+  // 静态开发入口也加载生成文件，重建后必须失效旧页面缓存。
+  if (!app.isPackaged && process.env.WECHAT_TOOL_STATIC_UI !== "1") return null;
   try {
-    return path.join(process.resourcesPath, "ui");
+    return process.env.WECHAT_TOOL_UI_DIR?.trim() || (app.isPackaged
+      ? path.join(process.resourcesPath, "ui")
+      : path.join(__dirname, "..", "..", "frontend", ".output", "public"));
   } catch {
     return null;
   }
@@ -1283,7 +1292,7 @@ async function applyPendingOutputDirOnStartup() {
 }
 
 async function refreshRendererCacheForPackagedUi() {
-  if (!app.isPackaged) return;
+  if (!app.isPackaged && process.env.WECHAT_TOOL_STATIC_UI !== "1") return;
 
   const nextBuildId = readPackagedUiBuildId();
   if (!nextBuildId) return;
@@ -1302,6 +1311,7 @@ async function refreshRendererCacheForPackagedUi() {
     logMain(`[main] cleared renderer cache for UI build change: ${prevBuildId || "(none)"} -> ${nextBuildId}`);
   } catch (err) {
     logMain(`[main] failed to clear renderer cache for UI build change: ${err?.message || err}`);
+    return;
   }
 
   loadDesktopSettings();
@@ -2114,10 +2124,17 @@ function startBackend() {
     WECHAT_TOOL_PORT: String(getBackendPort()),
     WECHAT_TOOL_DATA_DIR: resolvedDataPath,
     WECHAT_TOOL_OUTPUT_DIR: resolvedOutputPath,
+    // The packaged backend cannot rely on Finder/Explorer inheriting a shell PATH.
+    // Reuse this exact Electron executable as Node only for the SNS WASM child.
+    WECHAT_TOOL_NODE_EXECUTABLE: process.execPath,
+    WECHAT_TOOL_NODE_MODE: "electron-run-as-node",
     // Electron decodes the backend pipe as UTF-8. Do not inherit an ambient
     // Windows code page such as cp950, which cannot encode Simplified Chinese.
     PYTHONIOENCODING: "utf-8",
   };
+  // Never turn the backend (or the Electron main process) globally into Node.
+  // Python scopes this flag to the single WASM helper subprocess.
+  delete env.ELECTRON_RUN_AS_NODE;
   configureNativeCoreRuntime(env);
   clearLegacyWcdbEnvironment(env);
   logMain(
@@ -2157,7 +2174,9 @@ function startBackend() {
     // The desktop backend only needs runtime dependencies. Letting `uv run`
     // include the default dev group can block Electron startup on an unrelated
     // pytest/Pygments download before Python is even launched.
-    backendProc = spawn("uv", ["run", "--no-dev", "main.py"], {
+    const voiceExtras = ["--extra", "voice-transcription"];
+    if (env.WECHAT_TOOL_QWEN_GPU === "1") voiceExtras.push("--extra", "voice-transcription-gpu");
+    backendProc = spawn("uv", ["run", "--no-dev", ...voiceExtras, "main.py"], {
       cwd: repoRoot(),
       env,
       stdio: "inherit",
@@ -2433,6 +2452,8 @@ function setupRendererLifecycleLogging(win) {
   const logRendererLifecycle = (message) => {
     logMain(`[renderer] ${message}`);
   };
+  win.on('show', () => logRendererLifecycle('window-show'));
+  win.on('hide', () => logRendererLifecycle('window-hide'));
 
   logRendererLifecycle(`window-created id=${win.id}`);
 
@@ -2541,25 +2562,15 @@ async function loadWithRetry(win, url) {
     attempt += 1;
     logMain(`[main] loadWithRetry attempt=${attempt} url=${url}`);
     try {
-      await win.loadURL(url);
+      const remaining = Math.max(1, 60_000 - (Date.now() - startedAt));
+      await loadWithRedirect(win, url, Math.min(5000, remaining), remaining);
       logMain(`[main] loadWithRetry success attempt=${attempt} elapsedMs=${Date.now() - startedAt} url=${url}`);
       return;
     } catch (err) {
       logMain(
         `[main] loadWithRetry failure attempt=${attempt} elapsedMs=${Date.now() - startedAt} url=${url} error=${err?.message || err}`
       );
-      // Nuxt's agreement middleware redirects a first-time user from `/` to
-      // `/agreement`. Electron 40 reports that successful same-origin client
-      // navigation as ERR_ABORTED, even though the redirected page continues
-      // loading. Treat only a confirmed same-origin abort as a completed load;
-      // genuine network and cross-origin failures still use the retry path.
-      if (isSameOriginNavigationAbort(win, url, err)) {
-        logMain(
-          `[main] loadWithRetry accepted same-origin navigation url=${win.webContents.getURL()}`
-        );
-        return;
-      }
-      if (Date.now() - startedAt > 60_000) throw new Error(`Failed to load URL in time: ${url}`);
+      if (Date.now() - startedAt >= 60_000) throw new Error(`Failed to load URL in time: ${url}`);
       await new Promise((r) => setTimeout(r, 500));
     }
   }
@@ -2793,6 +2804,14 @@ function getWrappedBatch(rawId) {
 }
 
 function registerWindowIpc() {
+  ipcMain.handle('ai:diagnosticFallback', (event, entries) => {
+    if (event.sender !== mainWindow?.webContents) return false;
+    return require('./ai-diagnostics.cjs').writeFallback(entries, logMain);
+  });
+  ipcMain.handle('ai:takeNavigation', (event) => {
+    if (event.sender !== mainWindow?.webContents) return null;
+    return aiNotifications?.takeTarget() || null;
+  });
   const getWin = (event) => BrowserWindow.fromWebContents(event.sender);
 
   ipcMain.handle("window:minimize", (event) => {
@@ -3429,9 +3448,14 @@ async function ensureMainWindowReady() {
     logMain(`[main] debugEnabled=${debugEnabled()} startUrl=${startUrl}`);
     await loadWithRetry(win, startUrl);
 
-    if (debugEnabled()) {
+    // 首次创建不能只依赖构造器的显示行为；隐藏启动标志可能留下不可见主窗口。
+    if (mainWindow === win && !win.isDestroyed()) showMainWindow();
+
+    // 常规开发版启动也先显示应用；仅显式调试启动自动打开工具窗口。
+    if (debugEnabled() && (process.env.WECHAT_DESKTOP_DEBUG === "1" || process.argv.includes("--debug") || process.argv.includes("--devtools"))) {
       try {
-        win.webContents.openDevTools({ mode: "detach" });
+        // 调试窗口不抢走主窗口焦点，启动后用户能直接看到应用。
+        win.webContents.openDevTools({ mode: "detach", activate: false });
       } catch {}
     }
 
@@ -3448,12 +3472,7 @@ async function ensureMainWindowReady() {
 async function main() {
   await app.whenReady();
   if (app.isPackaged && process.platform === "win32") {
-    const evidence = ensurePrivatePkiIssuerCached({
-      resourcesPath: process.resourcesPath,
-    });
-    logMain(
-      `[private-pki] issuer=${evidence.issuerStore} root=${evidence.rootSha256.slice(0, 12)} newlyAdded=${evidence.newlyAdded === true}`
-    );
+    resolvePrivatePkiRuntime(process.resourcesPath);
   }
   if (app.isPackaged && process.platform === "darwin") {
     const evidence = ensureMacosPrivatePkiTrust({
@@ -3480,6 +3499,21 @@ async function main() {
 
   await ensureMainWindowReady();
 
+  const { createAiNotifications } = require('./ai-notifications.cjs');
+  aiDiagnostics = require('./ai-diagnostics.cjs').createAiDiagnostics({ getPort: getBackendPort, log: logMain });
+  aiNotifications = createAiNotifications({
+    diagnostics: aiDiagnostics,
+    Notification,
+    getPort: getBackendPort,
+    dataDir: app.getPath('userData'),
+    navigate: async (target) => {
+      await ensureMainWindowReady();
+      requestMainWindow('ai-notification');
+      mainWindow?.webContents.send('ai:navigate', target);
+    },
+  });
+  aiNotifications.start();
+
   // Auto-check updates once after the first UI load (packaged builds only).
   checkForUpdatesOnStartup();
 }
@@ -3504,6 +3538,8 @@ app.on("will-quit", () => {
 });
 
 app.on("before-quit", () => {
+  aiNotifications?.stop();
+  aiDiagnostics?.stop();
   isQuitting = true;
   destroyTray();
   stopBackend();

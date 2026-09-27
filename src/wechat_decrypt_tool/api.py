@@ -24,6 +24,7 @@ from .path_fix import PathFixRoute
 from .chat_realtime_autosync import CHAT_REALTIME_AUTOSYNC
 from .sns_realtime_autosync import SNS_REALTIME_AUTOSYNC
 from .routers.chat import router as _chat_router
+from .routers.chat_realtime_sse import router as _chat_realtime_sse_router
 from .routers.chat_contacts import router as _chat_contacts_router
 from .routers.chat_export import router as _chat_export_router
 from .routers.chat_media import router as _chat_media_router
@@ -53,6 +54,7 @@ from .wcdb_realtime import WCDB_REALTIME, shutdown as _wcdb_shutdown
 from .img_helper import IMG_HELPER
 from .routers.biz import router as _biz_router
 from .routers.system import router as _system_router
+from .routers.cdn import router as _cdn_router
 
 app = FastAPI(
     title="微信数据库解密工具",
@@ -66,6 +68,7 @@ app.router.route_class = PathFixRoute
 # Enable CORS for React frontend
 app.add_middleware(
     CORSMiddleware,
+    expose_headers=['X-WCDA-AI-Trace', 'X-WCDA-AI-Diagnostic'],
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
@@ -128,6 +131,12 @@ async def _record_content_free_product_events(request: Request, call_next):
 app.add_middleware(ChatRequestPerfMiddleware, logger=request_logger)
 
 
+from .routers.ai import router as _ai_router
+app.include_router(_ai_router)
+from .routers.ai_agent import router as _ai_agent_router
+app.include_router(_ai_agent_router)
+from .routers.local_search import router as _local_search_router
+app.include_router(_local_search_router)
 app.include_router(_health_router)
 app.include_router(_admin_router)
 app.include_router(_account_archive_export_router)
@@ -139,6 +148,7 @@ app.include_router(_keys_router)
 app.include_router(_media_router)
 app.include_router(_mcp_router)
 app.include_router(_chat_router)
+app.include_router(_chat_realtime_sse_router)
 app.include_router(_chat_contacts_router)
 app.include_router(_chat_export_router)
 app.include_router(_chat_media_router)
@@ -150,6 +160,7 @@ app.include_router(_general_router)
 app.include_router(_favorites_router)
 app.include_router(_record_export_router)
 app.include_router(_system_router)
+app.include_router(_cdn_router)
 
 
 # Python's MIME database inherits Windows registry overrides.  Keep the
@@ -298,6 +309,8 @@ async def _startup_native_core() -> None:
 
 @app.on_event("startup")
 async def _startup_background_jobs() -> None:
+    from .ai.lifecycle import start_services
+    await start_services()
     try:
         from .wechat_update_guard import start_update_guard_enforcer
 
@@ -314,12 +327,18 @@ async def _startup_background_jobs() -> None:
         logger.exception("Failed to start realtime autosync service")
     try:
         SNS_REALTIME_AUTOSYNC.start()
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to start SNS realtime autosync service")
+        logger.error(
+            "[sns.incremental-sync] status=error phase=service-start error_type=%s",
+            type(exc).__name__,
+        )
 
 
 @app.on_event("shutdown")
 async def _shutdown_wcdb_realtime() -> None:
+    from .ai.lifecycle import stop_services
+    await stop_services()
     try:
         from .wechat_update_guard import stop_update_guard_enforcer
 
@@ -373,9 +392,9 @@ if __name__ == "__main__":
     import uvicorn
 
     from .native_core_client import configure_native_core_entrypoint
-    from .runtime_settings import read_effective_backend_port
+    from .runtime_settings import default_backend_host, read_effective_backend_port
 
     configure_native_core_entrypoint()
-    host = os.environ.get("WECHAT_TOOL_HOST", "127.0.0.1")
+    host = os.environ.get("WECHAT_TOOL_HOST", default_backend_host())
     port, _ = read_effective_backend_port(default=10392)
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, log_config=None)

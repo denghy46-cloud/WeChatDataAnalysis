@@ -20,6 +20,8 @@ from enum import Enum, IntEnum, IntFlag
 from pathlib import Path
 from typing import Any, Callable
 
+from .runtime_settings import remote_calls_enabled
+
 
 WCE_CLIENT_ABI_VERSION = 1
 WCE_PROTOCOL_VERSION = 2
@@ -539,6 +541,7 @@ class NativeCoreBuildManifest:
     macos_client_signing_identifier: str = ""
     macos_broker_signing_identifier: str = ""
     macos_host_signing_identifier: str = ""
+    read_only_build: bool = True
     source_runtime: bool = False
     windows_host_verification: str = ""
     macos_host_verification: str = ""
@@ -957,6 +960,8 @@ def _load_native_core_build_manifest(
     native_asr_feature_bit_value = payload.get("nativeAsrFeatureBit", 0)
     native_asr_authorization_value = payload.get("nativeAsrAuthorization", "")
     native_asr_target_value = payload.get("nativeAsrTarget")
+    read_only_build = payload.get("readOnlyBuild")
+    wechat_actions_value = payload.get("wechatActions")
     offline_export_seal_format = payload.get("offlineExportSealFormat")
     distribution_mode_value = payload.get("distributionMode")
     distribution_capsule_value = payload.get("distributionCapsule")
@@ -972,6 +977,16 @@ def _load_native_core_build_manifest(
         raise NativeCoreProtocolError(
             "wechatdb native schemaVersion 2 must not declare a platform."
         )
+    if schema_version == 2 and (
+        read_only_build is not True
+        or not isinstance(wechat_actions_value, list)
+        or wechat_actions_value
+    ):
+        raise NativeCoreProtocolError(
+            "Windows wechatdb native build manifest must declare readOnlyBuild=true and no WeChat actions."
+        )
+    if schema_version == 3:
+        read_only_build = True
     source_runtime = False
     windows_host_verification = ""
     macos_host_verification = ""
@@ -1289,6 +1304,7 @@ def _load_native_core_build_manifest(
         native_asr_authorization=native_asr_authorization_value,
         native_asr_target_wechat_version=native_asr_target_wechat_version,
         native_asr_target_weixin_sha256=native_asr_target_weixin_sha256,
+        read_only_build=read_only_build,
         macos_client_signer_sha256=macos_client_signer_digest,
         macos_broker_signer_sha256=macos_broker_signer_digest,
         macos_host_signer_sha256=macos_host_signer_digest,
@@ -1349,7 +1365,18 @@ def _required_native_core_build_manifest(
 
         validate_native_core_authorization_policy(manifest)
         return manifest
-    if not frozen and _is_source_public_native_core_build_manifest(manifest):
+    if (
+        frozen
+        and manifest.platform == "windows"
+        and _is_source_public_native_core_build_manifest(manifest)
+    ):
+        from .native_core_lease import validate_native_core_authorization_policy
+
+        validate_native_core_authorization_policy(manifest)
+        return manifest
+    if _is_source_public_native_core_build_manifest(manifest) and (
+        not frozen or remote_calls_enabled()
+    ):
         from .native_core_lease import validate_native_core_authorization_policy
 
         validate_native_core_authorization_policy(manifest)
@@ -1397,7 +1424,8 @@ def _is_production_native_core_build_manifest_base(
     manifest: NativeCoreBuildManifest,
 ) -> bool:
     return (
-        not manifest.development_build
+        manifest.read_only_build
+        and not manifest.development_build
         and manifest.code_signature_enforced
         and manifest.root_public_key_compiled
         and not manifest.test_hooks_enabled
@@ -1424,6 +1452,7 @@ def _is_production_native_core_build_manifest(manifest: NativeCoreBuildManifest)
 def _is_development_native_core_build_manifest(manifest: NativeCoreBuildManifest) -> bool:
     return (
         manifest.build_id == "dev-local"
+        and manifest.read_only_build
         and manifest.development_build
         and not manifest.code_signature_enforced
         and not manifest.root_public_key_compiled
@@ -1437,6 +1466,7 @@ def _is_development_native_core_build_manifest(manifest: NativeCoreBuildManifest
 def _is_staging_native_core_build_manifest(manifest: NativeCoreBuildManifest) -> bool:
     return (
         manifest.platform == "windows"
+        and manifest.read_only_build
         and not manifest.development_build
         and manifest.code_signature_enforced
         and manifest.root_public_key_compiled

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -480,6 +481,35 @@ class TestMcpRouter(unittest.TestCase):
         self.assertNotIn("freshness", structured)
         self.assertFalse(calls[0]["allow_native_enrichment"])
 
+    def test_mcp_stringifies_integers_outside_javascript_safe_range(self):
+        client = self._client()
+
+        class FakeChatRouter:
+            async def search_chat_messages(self, _request, **_kwargs):
+                return {
+                    "status": "success",
+                    "index": {"indexMtimeNs": 9007199254740993},
+                    "hits": [{"serverId": 9007199254740993}],
+                    "limit": 20,
+                }
+
+        with patch("wechat_decrypt_tool.mcp.tools._chat_router", return_value=FakeChatRouter()):
+            resp = client.post(
+                "/mcp",
+                json=self._rpc(
+                    "tools/call",
+                    {"name": "wechat.chat.search_messages", "arguments": {"query": "xlsx"}},
+                ),
+            )
+
+        structured = resp.json()["result"]["structuredContent"]
+        self.assertEqual(structured["index"]["indexMtimeNs"], "9007199254740993")
+        self.assertEqual(structured["hits"][0]["serverId"], "9007199254740993")
+        self.assertEqual(structured["limit"], 20)
+        self.assertIn('"serverId": "9007199254740993"', resp.json()["result"]["content"][0]["text"])
+        tools = {tool["name"]: tool for tool in client.post("/mcp", json=self._rpc("tools/list")).json()["result"]["tools"]}
+        self.assertEqual(tools["wechat.chat.resolve_app_message"]["inputSchema"]["properties"]["server_id"]["type"], "string")
+
     def test_mcp_chat_search_decrypted_declares_snapshot_freshness(self):
         client = self._client()
 
@@ -677,6 +707,12 @@ class TestMcpRouter(unittest.TestCase):
                     "account": "wxid_acc",
                     "deep_scan": True,
                     "prefer_live": True,
+                    "fetch_remote": True,
+                    "src_create_time": 1735689600,
+                    "file_size": 2048,
+                    "record_index": 0,
+                    "record_index_path": "0/1",
+                    "record_attach": "folder/image & original.dat",
                 },
             ),
         )
@@ -686,6 +722,13 @@ class TestMcpRouter(unittest.TestCase):
         self.assertEqual(image["params"]["file_id"], "fid")
         self.assertTrue(image["params"]["deep_scan"])
         self.assertTrue(image["params"]["prefer_live"])
+        query = parse_qs(urlsplit(image["url"]).query)
+        self.assertEqual(query["fetch_remote"], ["True"])
+        self.assertEqual(query["src_create_time"], ["1735689600"])
+        self.assertEqual(query["file_size"], ["2048"])
+        self.assertEqual(query["record_index"], ["0"])
+        self.assertEqual(query["record_index_path"], ["0/1"])
+        self.assertEqual(query["record_attach"], ["folder/image & original.dat"])
 
         moments_resp = client.post(
             "/mcp",
@@ -700,6 +743,28 @@ class TestMcpRouter(unittest.TestCase):
         self.assertEqual(moments["params"]["media_id"], "media-a")
         self.assertNotIn("use_cache", moments["params"])
         self.assertNotIn("use_cache", moments["url"])
+
+    def test_image_tool_exposes_large_image_options_and_defaults(self):
+        with self._client() as client:
+            listed = client.post("/mcp", json=self._rpc("tools/list")).json()["result"]["tools"]
+            tool = next(item for item in listed if item["name"] == "wechat.media.get_chat_image_url")
+            properties = tool["inputSchema"]["properties"]
+            self.assertTrue(properties["prefer_live"]["default"])
+            self.assertFalse(properties["fetch_remote"]["default"])
+            self.assertIn("server_id", properties)
+            self.assertIn("record_index_path", properties)
+            for options, expected in [({}, "True"), ({"prefer_live": False, "fetch_remote": False}, "False")]:
+                with self.subTest(options=options):
+                    result = client.post("/mcp", json=self._rpc("tools/call", {
+                        "name": "wechat.media.get_chat_image_url",
+                        "arguments": {"md5": "abc", **options},
+                    })).json()["result"]["structuredContent"]
+                    query = parse_qs(urlsplit(result["url"]).query)
+                    self.assertEqual(query["prefer_live"], [expected])
+                    if options:
+                        self.assertEqual(query["fetch_remote"], ["False"])
+                    else:
+                        self.assertNotIn("fetch_remote", query)
 
     def test_completed_mcp_packages_and_mobile_facade_are_listed(self):
         client = self._client()

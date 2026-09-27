@@ -13,9 +13,24 @@
                 :disabled="!selectedAccount || isRefreshing || isLoading"
                 @click="refreshSnsData"
             >
-              {{ isRefreshing ? '刷新中…' : '刷新' }}
+              {{ snsFullSyncButtonLabel }}
             </button>
           </div>
+        </div>
+        <div
+            v-if="snsFullSyncJob"
+            class="mt-1 flex min-h-5 items-center justify-end gap-2 text-[11px] text-gray-500"
+        >
+          <span>{{ snsFullSyncStatusText }}</span>
+          <button
+              v-if="isSnsFullSyncActive"
+              type="button"
+              class="text-gray-500 hover:text-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
+              :disabled="isSnsFullSyncCancelling || snsFullSyncJob?.cancelRequested"
+              @click="cancelSnsFullSync"
+          >
+            {{ isSnsFullSyncCancelling || snsFullSyncJob?.cancelRequested ? '取消中…' : '取消' }}
+          </button>
         </div>
         <input
             v-model="snsUserQuery"
@@ -26,6 +41,13 @@
         <div v-if="syncWarning" class="mt-2 text-xs leading-5 text-amber-700">{{ syncWarning }}</div>
 
         <div class="mt-3">
+          <button
+              type="button"
+              class="mb-2 w-full px-3 py-2.5 rounded-md text-sm border border-gray-200 bg-white hover:bg-gray-50 transition-colors"
+              @click="openPublishUnavailableDialog"
+          >
+            发布朋友圈
+          </button>
           <button
               type="button"
               class="w-full px-3 py-2.5 rounded-md text-sm border border-gray-200 bg-white hover:bg-gray-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -77,7 +99,7 @@
           <div class="flex-1 min-w-0">
             <div class="truncate" :class="{ 'privacy-blur': privacyMode }">{{ u.displayName || u.username }}</div>
             <div class="text-[11px] text-gray-400 truncate">
-              <span>{{ u.username }}</span>
+              <span :class="{ 'privacy-blur': privacyMode }">{{ u.username }}</span>
               <span> · </span>
               <!-- `postCount` is computed from the decrypted sqlite snapshot (cache). The timeline API may only return
                    the visible subset (e.g. privacy setting: "only last 3 days"), so show loaded/cache for the selected user. -->
@@ -149,14 +171,15 @@
 
                 <div class="w-[72px] h-[72px] rounded-lg bg-white p-[2px] shadow-sm">
                   <img
-                      v-if="selfInfo.wxid"
+                      v-if="postAvatarUrl(selfInfo.wxid) && !hasSnsAvatarError(selfInfo.wxid)"
                       :src="postAvatarUrl(selfInfo.wxid)"
                       class="w-full h-full rounded-md object-cover bg-gray-100"
                       :alt="selfInfo.nickname"
                       referrerpolicy="no-referrer"
+                      @error="onSnsAvatarError(selfInfo.wxid)"
                   />
                   <div v-else class="w-full h-full rounded-md bg-gray-300 flex items-center justify-center text-gray-500 text-xs">
-                    ...
+                    {{ (selfInfo.nickname || '我').charAt(0) }}
                   </div>
                 </div>
               </div>
@@ -195,11 +218,12 @@
 	            <div class="flex items-start gap-3" @contextmenu.prevent="openPostContextMenu($event, post)">
               <div class="w-9 h-9 rounded-md overflow-hidden bg-gray-300 flex-shrink-0" :class="{ 'privacy-blur': privacyMode }">
                 <img
-                  v-if="postAvatarUrl(post.username)"
+                  v-if="postAvatarUrl(post.username) && !hasSnsAvatarError(post.username)"
                   :src="postAvatarUrl(post.username)"
                   :alt="post.displayName || post.username"
                   class="w-full h-full object-cover"
                   referrerpolicy="no-referrer"
+                  @error="onSnsAvatarError(post.username)"
                 />
                 <div
                   v-else
@@ -1095,16 +1119,31 @@
 	        </svg>
 	      </button>
 	    </div>
+
+    <GuideDialog
+      :open="publishUnavailableDialogOpen"
+      eyebrow="功能暂未开放"
+      :title="DEVELOPER_CONTACT_TITLE"
+      :description="FEATURE_UNAVAILABLE_MESSAGE"
+      :primary-label="DEVELOPER_CONTACT_LABEL"
+      secondary-label="关闭"
+      tone="warning"
+      @primary="contactDeveloper"
+      @secondary="closePublishUnavailableDialog"
+      @close="closePublishUnavailableDialog"
+    />
 	  </div>
-	</template>
+</template>
 
 <script setup>
 import { storeToRefs } from 'pinia'
+import { DEVELOPER_CONTACT_LABEL, DEVELOPER_CONTACT_TITLE, FEATURE_UNAVAILABLE_MESSAGE, openDeveloperContact } from '~/lib/developer-support'
 import { useChatAccountsStore } from '~/stores/chatAccounts'
 import { usePrivacyStore } from '~/stores/privacy'
 import { parseTextWithEmoji } from '~/lib/wechat-emojis'
 import { SNS_SETTING_USE_CACHE_KEY, readLocalBoolSetting } from '~/lib/desktop-settings'
 import { reportServerErrorFromError, reportServerErrorFromResponse } from '~/lib/server-error-logging'
+import { selectSnsImageSource } from '~/lib/sns-media-source'
 
 useHead({ title: '朋友圈 - 微信数据分析助手' })
 
@@ -1130,11 +1169,42 @@ const timelineScrollEl = ref(null)
 const snsUserScrollEl = ref(null)
 const isLoading = ref(false)
 const isRefreshing = ref(false)
+const snsFullSyncJob = ref(null)
+const isSnsFullSyncCancelling = ref(false)
+const isSnsFullSyncActive = computed(() => {
+  const status = String(snsFullSyncJob.value?.status || '')
+  return status === 'queued' || status === 'running'
+})
+const snsFullSyncButtonLabel = computed(() => {
+  if (isRefreshing.value) return '启动中…'
+  return isSnsFullSyncActive.value ? '同步中' : '刷新'
+})
+const snsFullSyncStatusText = computed(() => {
+  const job = snsFullSyncJob.value
+  const status = String(job?.status || '')
+  const progress = job?.progress || {}
+  const changed = Math.max(0, Number(progress?.changed || 0))
+  const percent = Math.max(0, Math.min(100, Number(progress?.percent || 0)))
+  if (status === 'queued') return `等待同步 · 已变化 ${changed}`
+  if (status === 'running') return `${percent}% · 已变化 ${changed}`
+  if (status === 'done') return `同步完成 · 已变化 ${changed}`
+  if (status === 'cancelled') return `已取消 · 已保留变化 ${changed}`
+  if (status === 'error') return `同步失败 · 已保留变化 ${changed}`
+  return ''
+})
 // 首次水合时保持按钮禁用，挂载后再按账号状态启用，避免服务端 disabled 残留。
 const isSnsPageMounted = ref(false)
 const error = ref('')
 const syncWarning = ref('')
 const snsUseCache = ref(true)
+const publishUnavailableDialogOpen = ref(false)
+
+const openPublishUnavailableDialog = () => { publishUnavailableDialogOpen.value = true }
+const closePublishUnavailableDialog = () => { publishUnavailableDialogOpen.value = false }
+const contactDeveloper = () => {
+  closePublishUnavailableDialog()
+  void openDeveloperContact()
+}
 
 const coverData = ref(null)
 const covers = ref([])
@@ -2468,6 +2538,10 @@ const formatMomentTypeLabel = (post) => {
     const name = String(post?.finderFeed?.nickname || '').trim()
     return name ? `视频号·${name}` : '视频号'
   }
+  if (t === 34) {
+    const name = String(post?.finderLive?.nickname || '').trim()
+    return name ? `视频号直播·${name}` : '视频号直播'
+  }
   if (isExternalShareMoment(post)) return formatExternalShareSourceLabel(post)
   return ''
 }
@@ -2653,10 +2727,11 @@ const mediaSizeGroupIndex = (post, m, idx) => {
 }
 
 const getSnsMediaUrl = (post, m, idx, rawUrl, options = {}) => {
-  const raw = upgradeTencentHttps(String(rawUrl || '').trim())
+  const preferFull = !!options?.preferFull
+  const selectedSource = selectSnsImageSource(m, rawUrl, { preferFull })
+  const raw = upgradeTencentHttps(String(selectedSource.url || '').trim())
   if (!raw) return ''
   const rawLower = raw.toLowerCase()
-  const preferFull = !!options?.preferFull
 
   // If backend already provides a local media endpoint, rewrite it to the effective API base
   // (so web builds with a custom API port still work).
@@ -2667,8 +2742,7 @@ const getSnsMediaUrl = (post, m, idx, rawUrl, options = {}) => {
   if (/^https?:\/\//i.test(raw)) {
     try {
       const host = new URL(raw).hostname.toLowerCase()
-      const thumbCandidate = String(m?.thumb || m?.thumbUrl || '').trim()
-      const isThumbRequest = (!preferFull) && !!thumbCandidate && raw === upgradeTencentHttps(thumbCandidate)
+      const isThumbRequest = selectedSource.kind === 'thumbnail'
       if (
         host.endsWith('.qpic.cn')
         || host.endsWith('.qlogo.cn')
@@ -2708,32 +2782,19 @@ const getSnsMediaUrl = (post, m, idx, rawUrl, options = {}) => {
         const mediaType = String(m?.type || '2').trim()
         if (mediaType) parts.set('media_type', mediaType)
 
-        const token = String(
-          isThumbRequest
-            ? (m?.thumbToken || m?.thumbUrlToken || m?.thumbAttrs?.token || m?.token || m?.urlAttrs?.token || '')
-            : (m?.token || m?.urlAttrs?.token || m?.thumbToken || m?.thumbUrlToken || m?.thumbAttrs?.token || '')
-        ).trim()
+        const token = String(selectedSource.token || '').trim()
         if (token) parts.set('token', token)
 
-        // 视频封面与视频本体共用 `<enc key="...">` 里的 videoKey；
-        // thumbAttrs.key 常见值为 "0"，不能用于解密加密封面。
-        const videoKey = Number(m?.type || 0) === 6
-          ? String(m?.videoKey || '').trim()
-          : ''
-        const key = String(
-          isThumbRequest
-            ? (videoKey || m?.thumbKey || m?.thumbAttrs?.key || m?.key || m?.urlAttrs?.key || '')
-            : (videoKey || m?.key || m?.urlAttrs?.key || m?.thumbKey || m?.thumbAttrs?.key || '')
-        ).trim()
+        const key = String(selectedSource.key || '').trim()
         if (key) parts.set('key', key)
 
         parts.set('use_cache', snsUseCache.value ? '1' : '0')
         // When cache is disabled, bust browser caching so backend really downloads+decrypts each time.
         if (!snsUseCache.value) parts.set('_t', String(Date.now()))
         if (md5) parts.set('md5', md5)
-        if (preferFull) parts.set('variant', 'full')
+        if (selectedSource.variant === 'full') parts.set('variant', 'full')
         // 修改后端媒体匹配逻辑时递增版本号，避免浏览器复用旧的错误缓存。
-        parts.set('v', '14')
+        parts.set('v', '15')
         parts.set('url', raw)
         return `${apiBase}/sns/media?${parts.toString()}`
       }
@@ -2744,11 +2805,14 @@ const getSnsMediaUrl = (post, m, idx, rawUrl, options = {}) => {
 }
 
 const getMediaThumbSrc = (post, m, idx = 0) => {
-  return getSnsMediaUrl(post, m, idx, m?.thumb || m?.url)
+  const source = selectSnsImageSource(m, '', { preferFull: false })
+  return getSnsMediaUrl(post, m, idx, source.url)
 }
 
 const getMediaPreviewSrc = (post, m, idx = 0) => {
-  return getSnsMediaUrl(post, m, idx, m?.url || m?.originUrl || m?.originalUrl || m?.thumb || m?.thumbUrl, { preferFull: true })
+  const source = selectSnsImageSource(m, '', { preferFull: true })
+  if (!source.url) return getMediaThumbSrc(post, m, idx)
+  return getSnsMediaUrl(post, m, idx, source.url, { preferFull: source.variant === 'full' })
 }
 
 const inferSnsDownloadExt = (blob, url, isVideo = false) => {
@@ -2846,14 +2910,14 @@ const getCommentImages = (comment) => {
 
 const toCommentImageMedia = (img) => {
   if (!img || typeof img !== 'object') return null
-  const thumb = String(img.thumb || img.thumbUrl || img.thumb_url || img.url || '').trim()
-  const url = String(img.url || img.originUrl || img.origin_url || thumb || '').trim()
+  const thumb = String(img.thumb || img.thumbUrl || img.thumb_url || '').trim()
+  const url = String(img.url || img.originUrl || img.origin_url || '').trim()
   const mediaId = String(img.id || img.mediaId || img.media_id || '').trim()
   const md5 = String(img.md5 || '').trim()
   const token = String(img.token || img.urlToken || img.url_token || '').trim()
   const key = String(img.key || '').trim()
-  const thumbToken = String(img.thumbToken || img.thumbUrlToken || img.thumb_url_token || token || '').trim()
-  const thumbKey = String(img.thumbKey || img.thumb_key || key || '').trim()
+  const thumbToken = String(img.thumbToken || img.thumbUrlToken || img.thumb_url_token || '').trim()
+  const thumbKey = String(img.thumbKey || img.thumb_key || '').trim()
   const width = Number(img.width || img.size?.width || 0) || 0
   const height = Number(img.height || img.size?.height || 0) || 0
   const totalSize = Number(img.fileSize || img.file_size || img.size?.totalSize || img.size?.total_size || 0) || 0
@@ -3340,11 +3404,12 @@ const loadAccounts = async () => {
   }
 }
 
-let refreshQueued = false
 const SNS_REALTIME_SYNC_TIMEOUT_MS = 10000
 const SNS_VISIBLE_RECONCILE_BUFFER_MIN = 20
 const SNS_VISIBLE_RECONCILE_WINDOW_MAX = 200
-const SNS_MANUAL_REFRESH_SCAN_LIMIT = 200
+const SNS_INCREMENTAL_DEFAULT_SCAN_LIMIT = 200
+const SNS_FULL_SYNC_MERGE_THROTTLE_MS = 400
+const SNS_FULL_SYNC_USER_REFRESH_BATCHES = 5
 const SNS_EVENT_RECONNECT_DELAYS_MS = [1000, 2000, 5000, 10000, 30000]
 let snsSnapshotVersion = ''
 let snsRealtimeSyncInFlight = null
@@ -3355,6 +3420,10 @@ let snsEventReconnectTimer = null
 let snsEventReconnectAttempt = 0
 let snsLastEventSequence = 0
 let snsQueuedRealtimeEvent = null
+let snsQueuedFullSyncMerge = null
+let snsFullSyncMergePromise = null
+let snsFullSyncMergeTimer = null
+let snsFullSyncLastUserRefreshBatch = 0
 let snsPageUnmounted = false
 let snsVisiblePostStart = 0
 let snsVisiblePostEnd = -1
@@ -3409,7 +3478,7 @@ const beginSnsRealtimeSync = (
 const syncLatestSnsWithTimeout = async (
   account,
   {
-    maxScan = SNS_MANUAL_REFRESH_SCAN_LIMIT,
+    maxScan = SNS_INCREMENTAL_DEFAULT_SCAN_LIMIT,
     scanOffset = null,
     usernames = [],
     waitForCurrent = false
@@ -3486,77 +3555,55 @@ const describeSnsSyncFailure = (failure) => {
 }
 
 const refreshSnsData = async () => {
-  if (!String(selectedAccount.value || '').trim()) return
-  if (isRefreshing.value) {
-    refreshQueued = true
-    return
-  }
-
+  const account = String(selectedAccount.value || '').trim()
+  if (!account || isRefreshing.value) return
   isRefreshing.value = true
+  syncWarning.value = ''
   try {
-    do {
-      refreshQueued = false
-      const account = String(selectedAccount.value || '').trim()
-      if (!account) break
-      const reconcileWindow = getSnsVisibleReconcileWindow()
-      const selectedUsername = String(selectedSnsUser.value || '').trim()
-      let shouldMergeTimeline = false
-
-      // 按钮本身显示刷新状态，避免插入提示行导致联系人列表上下跳动。
-      syncWarning.value = ''
-      const activeReconcile = snsVisibleReconcilePromise
-      if (activeReconcile) {
-        try {
-          await activeReconcile
-        } catch {}
+    const response = await api.startSnsFullSync({ account })
+    if (account !== String(selectedAccount.value || '').trim()) return
+    const job = response?.job || null
+    applySnsFullSyncJob(job)
+    isSnsFullSyncCancelling.value = false
+    if (job) {
+      const status = String(job?.status || '')
+      const final = status === 'done' || status === 'error' || status === 'cancelled'
+      const version = String(job?.snapshotVersion || '').trim()
+      if (final || (version && version !== snsSnapshotVersion)) {
+        queueSnsFullSyncMerge(job, { final })
       }
-      try {
-        const syncResult = await syncLatestSnsWithTimeout(account, {
-          maxScan: SNS_MANUAL_REFRESH_SCAN_LIMIT,
-          scanOffset: reconcileWindow.scanOffset,
-          usernames: selectedUsername ? [selectedUsername] : [],
-          waitForCurrent: true
-        })
-        const syncStatus = String(syncResult?.status || '').trim().toLowerCase()
-        if (syncStatus === 'ok' || syncStatus === 'noop') {
-          syncWarning.value = ''
-          const responseVersion = String(syncResult?.snapshotVersion || '').trim()
-          shouldMergeTimeline = !!(
-            Number(syncResult?.changed ?? syncResult?.upserted ?? 0) > 0
-            || syncResult?.snapshotChanged === true
-            || (responseVersion && snsSnapshotVersion && responseVersion !== snsSnapshotVersion)
-          )
-        } else {
-          syncWarning.value = describeSnsSyncFailure(syncResult)
-          console.warn('同步最新朋友圈未成功，继续读取已解密快照', syncResult)
-        }
-      } catch (e) {
-        syncWarning.value = describeSnsSyncFailure(e)
-        console.warn('同步最新朋友圈失败，继续读取已解密快照', e)
-      }
-      if (!shouldMergeTimeline) {
-        try {
-          const localVersion = await readSnsSnapshotVersion(account)
-          shouldMergeTimeline = !!(
-            localVersion
-            && snsSnapshotVersion
-            && localVersion !== snsSnapshotVersion
-          )
-        } catch {}
-      }
-      if (account !== String(selectedAccount.value || '').trim()) break
-      const refreshTasks = [loadSelfInfo()]
-      if (shouldMergeTimeline) {
-        refreshTasks.push(
-          loadSnsUsers({ preserveExisting: true }),
-          mergeVisiblePostsWindow(reconcileWindow)
-        )
-      }
-      await Promise.all(refreshTasks)
-      await updateSnsSnapshotBaseline(account)
-    } while (refreshQueued)
+    }
+  } catch (e) {
+    if (account === String(selectedAccount.value || '').trim()) {
+      syncWarning.value = describeSnsSyncFailure(e)
+    }
   } finally {
     isRefreshing.value = false
+  }
+}
+
+const cancelSnsFullSync = async () => {
+  const account = String(selectedAccount.value || '').trim()
+  const syncId = String(snsFullSyncJob.value?.syncId || '').trim()
+  if (!account || !syncId || !isSnsFullSyncActive.value || isSnsFullSyncCancelling.value) return
+  isSnsFullSyncCancelling.value = true
+  try {
+    const response = await api.cancelSnsFullSync({ account, sync_id: syncId })
+    if (
+      account === String(selectedAccount.value || '').trim()
+      && syncId === String(snsFullSyncJob.value?.syncId || '')
+      && response?.job
+    ) {
+      snsFullSyncJob.value = response.job
+    }
+  } catch (e) {
+    if (account === String(selectedAccount.value || '').trim()) {
+      syncWarning.value = describeSnsSyncFailure(e)
+    }
+  } finally {
+    if (account === String(selectedAccount.value || '').trim()) {
+      isSnsFullSyncCancelling.value = false
+    }
   }
 }
 
@@ -3865,6 +3912,145 @@ const mergeVisiblePostsWindow = async (windowRange = getSnsVisibleReconcileWindo
 
 const mergeLatestPosts = async () => mergeVisiblePostsWindow(getSnsVisibleReconcileWindow())
 
+const clearSnsFullSyncMergeTimer = () => {
+  if (!process.client || snsFullSyncMergeTimer === null) return
+  window.clearTimeout(snsFullSyncMergeTimer)
+  snsFullSyncMergeTimer = null
+}
+
+const drainSnsFullSyncMerge = () => {
+  clearSnsFullSyncMergeTimer()
+  if (snsFullSyncMergePromise) return snsFullSyncMergePromise
+
+  let trackedPromise = null
+  const task = (async () => {
+    let merged = false
+    while (snsQueuedFullSyncMerge) {
+      const pending = snsQueuedFullSyncMerge
+      snsQueuedFullSyncMerge = null
+      const account = String(pending?.account || '')
+      if (
+        !process.client
+        || snsPageUnmounted
+        || document.visibilityState !== 'visible'
+        || !account
+        || account !== String(selectedAccount.value || '').trim()
+      ) continue
+
+      const job = pending?.job || {}
+      const progress = job?.progress || {}
+      const snapshotVersion = String(job?.snapshotVersion || pending?.snapshotVersion || '').trim()
+      const changed = Math.max(0, Number(progress?.changed || 0))
+      const batch = Math.max(0, Number(progress?.batchesCompleted || 0))
+      const finalMerge = !!pending?.final
+      const snapshotChanged = !!(
+        snapshotVersion
+        && snapshotVersion !== snsSnapshotVersion
+        && (changed > 0 || finalMerge)
+      )
+      if (!snapshotChanged && !finalMerge) continue
+
+      const activeReconcile = snsVisibleReconcilePromise
+      if (activeReconcile) {
+        try {
+          await activeReconcile
+        } catch {}
+      }
+
+      const shouldRefreshUsers = finalMerge
+        || batch - snsFullSyncLastUserRefreshBatch >= SNS_FULL_SYNC_USER_REFRESH_BATCHES
+      const tasks = [mergeVisiblePostsWindow(getSnsVisibleReconcileWindow())]
+      if (shouldRefreshUsers) tasks.push(loadSnsUsers({ preserveExisting: true }))
+      const results = await Promise.all(tasks)
+      const timelineMerged = results[0] === true
+      if (!timelineMerged) continue
+
+      merged = true
+      if (shouldRefreshUsers) snsFullSyncLastUserRefreshBatch = batch
+      if (snapshotVersion) {
+        snsSnapshotVersion = snapshotVersion
+      } else {
+        await updateSnsSnapshotBaseline(account)
+      }
+    }
+    return merged
+  })()
+
+  trackedPromise = task.finally(() => {
+    if (snsFullSyncMergePromise === trackedPromise) snsFullSyncMergePromise = null
+    if (snsQueuedFullSyncMerge) void drainSnsFullSyncMerge()
+  })
+  snsFullSyncMergePromise = trackedPromise
+  return trackedPromise
+}
+
+// 全量同步事件使用累计进度；中间事件即使被合并，下一次事件仍能恢复正确状态。
+const queueSnsFullSyncMerge = (job, { final = false } = {}) => {
+  const account = String(selectedAccount.value || '').trim()
+  if (!account || !job) return null
+  const previous = snsQueuedFullSyncMerge
+  snsQueuedFullSyncMerge = {
+    account,
+    job,
+    snapshotVersion: String(job?.snapshotVersion || ''),
+    final: !!(final || previous?.final)
+  }
+
+  if (final) {
+    clearSnsFullSyncMergeTimer()
+    return drainSnsFullSyncMerge()
+  }
+  if (!process.client || snsFullSyncMergePromise || snsFullSyncMergeTimer !== null) {
+    return snsFullSyncMergePromise
+  }
+  snsFullSyncMergeTimer = window.setTimeout(() => {
+    snsFullSyncMergeTimer = null
+    void drainSnsFullSyncMerge()
+  }, SNS_FULL_SYNC_MERGE_THROTTLE_MS)
+  return null
+}
+
+const applySnsFullSyncJob = (job) => {
+  const previousSyncId = String(snsFullSyncJob.value?.syncId || '')
+  const nextSyncId = String(job?.syncId || '')
+  if (nextSyncId && nextSyncId !== previousSyncId) {
+    snsFullSyncLastUserRefreshBatch = 0
+  }
+  snsFullSyncJob.value = job || null
+  const status = String(job?.status || '')
+  if (status !== 'queued' && status !== 'running') {
+    isSnsFullSyncCancelling.value = false
+  }
+  if (status === 'error') {
+    syncWarning.value = String(job?.error?.message || '朋友圈全量同步失败，请稍后重试')
+  } else if (status === 'done' || status === 'cancelled') {
+    syncWarning.value = ''
+  }
+}
+
+const restoreSnsFullSyncStatus = async (account) => {
+  const requestedAccount = String(account || '').trim()
+  if (!requestedAccount) return null
+  try {
+    const response = await api.getSnsFullSyncStatus({ account: requestedAccount })
+    if (requestedAccount !== String(selectedAccount.value || '').trim()) return null
+    const job = response?.job || null
+    applySnsFullSyncJob(job)
+    if (job) {
+      const status = String(job?.status || '')
+      const final = status === 'done' || status === 'error' || status === 'cancelled'
+      const version = String(job?.snapshotVersion || '').trim()
+      if (final || (version && version !== snsSnapshotVersion)) {
+        queueSnsFullSyncMerge(job, { final })
+      }
+    }
+    return job
+  } catch {
+    // 状态恢复失败不影响本地快照浏览，SSE 重连后还会再次核对。
+    return null
+  }
+}
+
 // 首屏三路并行读取本地快照，不等待实时同步。
 const loadLocalSnsData = async () => {
   const account = String(selectedAccount.value || '').trim()
@@ -4045,6 +4231,7 @@ const onSnsRealtimeReady = async (event) => {
 
   snsEventReconnectAttempt = 0
   snsLastEventSequence = Math.max(snsLastEventSequence, Number(payload?.sequence || 0))
+  await restoreSnsFullSyncStatus(account)
   if (payload?.watcherAvailable === false) {
     syncWarning.value = String(payload?.message || '系统文件通知不可用，请使用手动刷新')
     return
@@ -4092,6 +4279,24 @@ const onSnsRealtimeSyncError = (event) => {
   syncWarning.value = String(payload?.message || '朋友圈实时同步失败，请使用手动刷新')
 }
 
+const onSnsFullSyncEvent = (event) => {
+  const payload = parseSnsRealtimeEvent(event)
+  const account = String(selectedAccount.value || '').trim()
+  if (!payload?.job || String(payload?.account || '') !== account) return
+  const sequence = Number(payload?.sequence || 0)
+  if (sequence > 0 && sequence <= snsLastEventSequence) return
+  snsLastEventSequence = Math.max(snsLastEventSequence, sequence)
+
+  const job = payload.job
+  applySnsFullSyncJob(job)
+  const status = String(job?.status || '')
+  const final = status === 'done' || status === 'error' || status === 'cancelled'
+  const snapshotVersion = String(job?.snapshotVersion || payload?.snapshotVersion || '').trim()
+  if (final || (snapshotVersion && snapshotVersion !== snsSnapshotVersion)) {
+    queueSnsFullSyncMerge(job, { final })
+  }
+}
+
 function connectSnsEventStream() {
   if (!process.client || snsPageUnmounted || document.visibilityState !== 'visible') return
   const account = String(selectedAccount.value || '').trim()
@@ -4110,6 +4315,10 @@ function connectSnsEventStream() {
   source.addEventListener('ready', onSnsRealtimeReady)
   source.addEventListener('change', onSnsRealtimeChange)
   source.addEventListener('sync_error', onSnsRealtimeSyncError)
+  source.addEventListener('full_sync_progress', onSnsFullSyncEvent)
+  source.addEventListener('full_sync_done', onSnsFullSyncEvent)
+  source.addEventListener('full_sync_error', onSnsFullSyncEvent)
+  source.addEventListener('full_sync_cancelled', onSnsFullSyncEvent)
   source.onerror = () => {
     if (source !== snsEventSource) return
     closeSnsEventStream()
@@ -4126,8 +4335,13 @@ watch(
     async (v, oldV) => {
       if (v !== oldV) {
         closeSnsEventStream({ resetAttempt: true })
+        clearSnsFullSyncMergeTimer()
         snsLastEventSequence = 0
         snsQueuedRealtimeEvent = null
+        snsQueuedFullSyncMerge = null
+        snsFullSyncJob.value = null
+        isSnsFullSyncCancelling.value = false
+        snsFullSyncLastUserRefreshBatch = 0
         snsSnapshotVersion = ''
       }
       if (v && v !== oldV) {
@@ -4152,6 +4366,7 @@ watch(
         resetSnsMediaErrors()
         if (previewCtx.value) closeImagePreview()
         await loadLocalSnsData()
+        await restoreSnsFullSyncStatus(String(v || ''))
         // 首屏就绪后建立事件连接；后端启动同步或重连差异由 ready 事件补齐。
         connectSnsEventStream()
       }
@@ -4228,6 +4443,7 @@ const runPassiveSnsRefresh = async () => {
   if (!String(selectedAccount.value || '').trim()) return
   // 窗口重新可见时只核对一次本地版本，然后恢复 SSE。
   await reconcileSnsSnapshotOnce()
+  await restoreSnsFullSyncStatus(String(selectedAccount.value || ''))
   connectSnsEventStream()
 }
 
@@ -4270,7 +4486,9 @@ onUnmounted(() => {
     passiveRefreshTimer = null
   }
   closeSnsEventStream({ resetAttempt: true })
+  clearSnsFullSyncMergeTimer()
   snsQueuedRealtimeEvent = null
+  snsQueuedFullSyncMerge = null
   if (snsVisibleWindowRaf !== null) {
     window.cancelAnimationFrame(snsVisibleWindowRaf)
     snsVisibleWindowRaf = null

@@ -5,10 +5,10 @@ import { defineConfig } from 'vitest/config'
 export default defineConfig({
   plugins: [vue()],
   resolve: {
-    alias: {
-      '~': fileURLToPath(new URL('.', import.meta.url)),
-      '@': fileURLToPath(new URL('.', import.meta.url))
-    }
+    alias: [
+      { find: '~', replacement: fileURLToPath(new URL('.', import.meta.url)) },
+      { find: '@', replacement: fileURLToPath(new URL('.', import.meta.url)) },
+    ]
   },
   test: {
     environment: 'happy-dom',

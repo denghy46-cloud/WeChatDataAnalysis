@@ -78,6 +78,35 @@
         </div>
       </div>
 
+      <button
+        type="button"
+        class="sidebar-rail-action w-full h-[var(--sidebar-rail-step)] flex items-center justify-center cursor-pointer group"
+        title="高级功能演示"
+        aria-label="高级功能演示"
+        @click="openAdvancedFeaturesDialog"
+      >
+        <span class="sidebar-rail-plate advanced-features-plate w-[var(--sidebar-rail-btn)] h-[var(--sidebar-rail-btn)] rounded-md flex items-center justify-center">
+          <i class="fa-solid fa-toolbox advanced-features-icon" aria-hidden="true"></i>
+        </span>
+      </button>
+
+      <!-- 套餐与额度（WxCDN 原图通道） -->
+      <button
+        type="button"
+        class="sidebar-rail-action w-full h-[var(--sidebar-rail-step)] flex items-center justify-center cursor-pointer group"
+        title="套餐与额度"
+        aria-label="套餐与额度"
+        @click="openPlanWindow('manual')"
+      >
+        <span class="sidebar-rail-plate w-[var(--sidebar-rail-btn)] h-[var(--sidebar-rail-btn)] rounded-md flex items-center justify-center transition-colors bg-transparent">
+          <svg class="sidebar-rail-icon w-[var(--sidebar-rail-icon)] h-[var(--sidebar-rail-icon)]" :class="{ 'sidebar-rail-icon-active': planWindowOpen }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4" width="18" height="16" rx="2" />
+            <circle cx="8.5" cy="9" r="1.5" />
+            <path d="m4.5 17 4.5-4.5 3.5 3 2.5-2.5 4.5 4" />
+          </svg>
+        </span>
+      </button>
+
       <!-- Favorites -->
       <div
         class="sidebar-rail-action w-full h-[var(--sidebar-rail-step)] flex items-center justify-center cursor-pointer group"
@@ -464,6 +493,8 @@
   </div>
 
   <GlobalExportDialog v-if="showGlobalExportEntry" :open="exportDialogOpen" @close="closeExportDialog" />
+
+  <AdvancedFeaturesDialog :open="advancedFeaturesDialogOpen" @close="closeAdvancedFeaturesDialog" />
 </template>
 
 <script setup>
@@ -499,6 +530,7 @@ const themeToggleTitle = computed(() => {
 })
 
 const { open: settingsDialogOpen, openDialog: openSettingsDialog } = useSettingsDialog()
+const { open: planWindowOpen, openPlanWindow } = usePlanWindow()
 const { getChatAccountInfo, deleteChatAccount } = useApi()
 
 const showGlobalExportEntry = true
@@ -513,6 +545,10 @@ const accountInfoApiUnsupported = ref(false)
 const deleteAccountApiUnsupported = ref(false)
 const brokenAvatarUrls = ref({})
 const isMacosDesktop = ref(false)
+const advancedFeaturesDialogOpen = ref(false)
+
+const openAdvancedFeaturesDialog = () => { advancedFeaturesDialogOpen.value = true }
+const closeAdvancedFeaturesDialog = () => { advancedFeaturesDialogOpen.value = false }
 
 const normalizeAccountName = (value) => String(value || '').trim()
 
@@ -853,6 +889,35 @@ const deleteCurrentAccountData = async () => {
 
 .sidebar-rail-action:hover .sidebar-rail-plate {
   background-color: var(--sidebar-rail-hover);
+}
+
+.advanced-features-plate {
+  --advanced-features-bg: var(--sidebar-rail-bg);
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--advanced-features-bg), var(--advanced-features-bg)) padding-box,
+    linear-gradient(110deg, rgba(7, 183, 91, 0.16) 42%, #07b75b 47%, #b9f6d3 50%, #07b75b 53%, rgba(7, 183, 91, 0.16) 58%) border-box;
+  background-repeat: no-repeat;
+  background-size: 100% 100%, 300% 100%;
+  animation: advanced-features-border-flow 2.4s linear infinite;
+}
+
+.sidebar-rail-action:hover .advanced-features-plate {
+  --advanced-features-bg: var(--sidebar-rail-hover);
+}
+
+.advanced-features-icon {
+  color: var(--sidebar-rail-icon-color);
+  font-size: 17px;
+}
+
+@keyframes advanced-features-border-flow {
+  from { background-position: 0 0, 100% 0; }
+  to { background-position: 0 0, 0 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .advanced-features-plate { animation: none; }
 }
 
 .sidebar-rail-icon {

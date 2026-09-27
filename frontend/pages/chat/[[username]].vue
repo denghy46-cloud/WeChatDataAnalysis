@@ -10,6 +10,15 @@
 
     <ResourceSidebar :state="chatState" />
     <VoiceTranscriptionSidebar :state="chatState" />
+    <GroupMembersSidebar
+      v-if="groupMembersSidebarOpen && selectedContact?.isGroup"
+      :key="`${selectedAccount}:${selectedContact.username}`"
+      :account="selectedAccount"
+      :username="selectedContact.username"
+      :privacy-mode="privacyMode"
+      :state="chatState"
+    />
+    <ChatAgentPanel v-if="aiSidebarOpen" :account="selectedAccount" :contact="selectedContact" :contacts="contacts" :focus-task-id="aiFocusTaskId" :locate-source="locateAiSource" :prepare-source="prepareAiSource" :profile-state="chatState" @close="aiSidebarOpen = false" />
     <ChatOverlays :state="chatState" />
   </div>
 </template>
@@ -20,6 +29,8 @@ import { storeToRefs } from 'pinia'
 
 import ResourceSidebar from '~/components/chat/ResourceSidebar.vue'
 import VoiceTranscriptionSidebar from '~/components/chat/VoiceTranscriptionSidebar.vue'
+import GroupMembersSidebar from '~/components/chat/GroupMembersSidebar.vue'
+import ChatAgentPanel from '~/components/chat/ChatAgentPanel.vue'
 import { useApi } from '~/composables/useApi'
 import { createEmptySearchContext, useChatSearch } from '~/composables/chat/useChatSearch'
 import { useChatSessions } from '~/composables/chat/useChatSessions'
@@ -157,7 +168,9 @@ const {
   enabled: realtimeEnabled,
   toggleSeq: realtimeToggleSeq,
   lastToggleAction: realtimeLastToggleAction,
-  changeSeq: realtimeChangeSeq
+  changeSeq: realtimeChangeSeq,
+  messageEvent: realtimeMessageEvent,
+  messageEventSeq: realtimeMessageEventSeq
 } = storeToRefs(realtimeStore)
 
 const searchContext = ref(createEmptySearchContext())
@@ -232,6 +245,7 @@ const {
   loadMoreMessages,
   refreshSelectedMessages,
   refreshCurrentMessageMedia,
+  applyRealtimeMessage,
   queueRealtimeRefresh,
   resetMessageState,
   onAvatarError,
@@ -257,6 +271,37 @@ const {
   onContactCardMouseEnter,
   toggleReverseMessageSides
 } = messageState
+
+const groupAnnouncement = ref('')
+const groupAnnouncementOpen = ref(false)
+let groupAnnouncementRequestSeq = 0
+
+const loadGroupAnnouncement = async (username) => {
+  const seq = ++groupAnnouncementRequestSeq
+  const account = String(selectedAccount.value || '').trim()
+  const target = String(username || '').trim()
+  groupAnnouncement.value = ''
+  groupAnnouncementOpen.value = false
+  if (!account || !target.endsWith('@chatroom')) return
+
+  try {
+    const response = await api.getChatContactProfile({ account, username: target, source: 'auto' })
+    if (
+      seq !== groupAnnouncementRequestSeq
+      || account !== String(selectedAccount.value || '').trim()
+      || target !== String(selectedContact.value?.username || '').trim()
+    ) return
+    groupAnnouncement.value = String(response?.contact?.announcement || '').trim()
+  } catch {}
+}
+
+const openGroupAnnouncement = () => {
+  if (groupAnnouncement.value) groupAnnouncementOpen.value = true
+}
+
+const closeGroupAnnouncement = () => {
+  groupAnnouncementOpen.value = false
+}
 
 let exitSearchContext = async () => {}
 
@@ -725,6 +770,7 @@ const closeVoiceSidebar = () => {
 }
 
 const openVoiceSidebar = () => {
+  aiSidebarOpen.value = false
   messageState.closeResourceSidebar()
   searchState.closeMessageSearch('voice-panel')
   searchState.closeTimeSidebar()
@@ -741,21 +787,25 @@ const toggleVoiceSidebar = () => {
 }
 
 const toggleChatResourceSidebar = async () => {
+  aiSidebarOpen.value = false
   closeVoiceSidebar()
   await messageState.toggleResourceSidebar()
 }
 
 const toggleChatMessageSearch = async () => {
+  aiSidebarOpen.value = false
   closeVoiceSidebar()
   await searchState.toggleMessageSearch()
 }
 
 const openChatMessageSearch = async () => {
+  aiSidebarOpen.value = false
   closeVoiceSidebar()
   await searchState.openMessageSearch()
 }
 
 const toggleChatTimeSidebar = async () => {
+  aiSidebarOpen.value = false
   closeVoiceSidebar()
   await searchState.toggleTimeSidebar()
 }
@@ -926,6 +976,7 @@ const onGlobalKeyDown = (event) => {
     if (searchState.messageSearchOpen.value) searchState.closeMessageSearch()
     if (searchState.timeSidebarOpen.value) searchState.closeTimeSidebar()
     if (voiceSidebarOpen.value) closeVoiceSidebar()
+    groupMembersSidebarOpen.value = false
     if (searchContext.value?.active) exitSearchContext()
   }
 }
@@ -1066,10 +1117,27 @@ onUnmounted(() => {
   stopExportPolling()
 })
 
-watch(realtimeChangeSeq, () => {
+watch(realtimeMessageEventSeq, (next, previous) => {
   if (!process.client || document.visibilityState === 'hidden') return
+  if (next === previous) return
   if (accountBootstrapInProgress || accountChangeInProgress) return
-  queueRealtimeRefresh()
+  const event = realtimeMessageEvent.value
+  const username = String(
+    event?.username
+    || event?.message?.username
+    || event?.message?.chatUsername
+    || event?.message?.sessionId
+    || ''
+  ).trim()
+  const selectedUsername = String(selectedContact.value?.username || '').trim()
+  if (username && username === selectedUsername) void applyRealtimeMessage(event)
+  queueRealtimeSessionsRefresh()
+})
+
+watch(realtimeChangeSeq, (next, previous) => {
+  if (!process.client || document.visibilityState === 'hidden') return
+  if (next === previous || realtimeMessageEvent.value?.type !== 'conversation_updated') return
+  if (accountBootstrapInProgress || accountChangeInProgress) return
   queueRealtimeSessionsRefresh()
 })
 
@@ -1095,6 +1163,7 @@ watch(
   () => selectedContact.value?.username,
   (username) => {
     realtimeStore.setPriorityUsername(username || '')
+    void loadGroupAnnouncement(username)
   }
 )
 
@@ -1131,7 +1200,87 @@ watch(
   }
 )
 
+const aiSidebarOpen = ref(false)
+const groupMembersSidebarOpen = ref(false)
+const toggleGroupMembersSidebar = () => {
+  if (groupMembersSidebarOpen.value) {
+    groupMembersSidebarOpen.value = false
+    return
+  }
+  if (!selectedContact.value?.isGroup) return
+  aiSidebarOpen.value = false
+  closeVoiceSidebar()
+  messageState.closeResourceSidebar()
+  searchState.closeMessageSearch('group-members')
+  searchState.closeTimeSidebar()
+  groupMembersSidebarOpen.value = true
+}
+watch([selectedAccount, () => selectedContact.value?.username], () => {
+  groupMembersSidebarOpen.value = false
+})
+watch([
+  aiSidebarOpen,
+  voiceSidebarOpen,
+  messageState.resourceSidebarOpen,
+  searchState.messageSearchOpen,
+  searchState.timeSidebarOpen
+], (opened) => {
+  if (opened.some(Boolean)) groupMembersSidebarOpen.value = false
+})
+const aiFocusTaskId = ref('')
+watch(selectedAccount, () => { aiFocusTaskId.value = '' })
+const aiNavigation = useState('ai-navigation-target', () => null)
+const aiDiagnosticApi = useAiApi()
+const toggleAiSidebar = () => {
+  aiSidebarOpen.value = !aiSidebarOpen.value
+  if (aiSidebarOpen.value) {
+    closeVoiceSidebar()
+    messageState.closeResourceSidebar()
+    searchState.closeMessageSearch('ai-panel')
+    searchState.closeTimeSidebar()
+  }
+}
+const diagnoseAiSource = async (source, operation) => {
+  const started = Date.now()
+  try {
+    const result = await operation()
+    aiDiagnosticApi.diagnostic(result === false ? 'source.failed' : 'source.ready', { component: 'source', source_id: source.source, duration_ms: Date.now() - started })
+    return result
+  } catch (error) {
+    aiDiagnosticApi.diagnostic('source.failed', { component: 'source', source_id: source.source, duration_ms: Date.now() - started, trace_id: error?.trace_id, diagnostic_id: error?.diagnostic_id })
+    throw error
+  }
+}
+const prepareAiSource = source => diagnoseAiSource(source, () => searchState.prepareAnchorContext({ targetUsername: source.username, anchorId: source.anchor }))
+const locateAiSource = source => diagnoseAiSource(source, () => searchState.locateByAnchorId({ targetUsername: source.username, anchorId: source.anchor, kind: 'ai', label: 'AI 消息来源', throwOnError: true }))
+const consumeAiNavigation = async () => {
+  const target = aiNavigation.value
+  if (!target) return
+  aiDiagnosticApi.diagnostic('navigation.started', { task_id: target.task_id, component: 'notification' })
+  try {
+  await chatAccounts.ensureLoaded()
+  if (target.account !== selectedAccount.value) chatAccounts.setSelectedAccount(target.account)
+  await nextTick()
+  // 等待现有账号切换流程结束，防止定位结果被初始会话加载覆盖。
+  for (let i = 0; i < 100 && (accountBootstrapInProgress || accountChangeInProgress); i++) await new Promise(resolve => setTimeout(resolve, 100))
+  if (aiNavigation.value !== target) { aiDiagnosticApi.diagnostic('response.stale', { task_id: target.task_id, component: 'notification' }); return }
+  aiSidebarOpen.value = true
+  aiFocusTaskId.value = target.task_id || ''
+  if (target.username && target.anchor) await locateAiSource(target)
+  aiNavigation.value = null
+  aiDiagnosticApi.diagnostic('navigation.finished', { task_id: target.task_id, component: 'notification' })
+  } catch {
+    aiDiagnosticApi.diagnostic('navigation.failed', { task_id: target.task_id, component: 'notification' })
+  }
+}
+watch(aiNavigation, () => { void consumeAiNavigation() })
+onMounted(() => { void consumeAiNavigation() })
+
 const chatState = {
+  groupMembersSidebarOpen,
+  toggleGroupMembersSidebar,
+  aiSidebarOpen,
+  toggleAiSidebar,
   chatAccounts,
   selectedAccount,
   availableAccounts,
@@ -1165,6 +1314,10 @@ const chatState = {
   ...exportState,
   ...editingState,
   ...historyState,
+  groupAnnouncement,
+  groupAnnouncementOpen,
+  openGroupAnnouncement,
+  closeGroupAnnouncement,
   voiceSidebarOpen,
   voicePanelBusy,
   voicePanelError,
